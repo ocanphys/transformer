@@ -5,6 +5,24 @@ from tqdm import tqdm
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""" 
 merges_dict = {}
 
+## helper functions
+
+def pair_decode(pair, pair_map):
+    """Return 'freq  (a, b)  (b'x', b'y')' for a pair."""
+    freq = pair_map.get(pair, 0)
+    decoded = tuple(bytes(decode([idx])) for idx in pair)
+    return f"{freq:>8}  {pair}  {decoded}"
+
+def peek_top_pairs(pair_heap, pair_map, n=5):
+    """Return top-n valid pairs as formatted strings without modifying pair_heap."""
+    snapshot = pair_heap.copy()
+    results = []
+    while snapshot and len(results) < n:
+        entry = heapq.heappop(snapshot)
+        results.append(pair_decode(entry[1], pair_map))
+    return results
+
+
 def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
     """
     Input
@@ -66,14 +84,24 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
 
 
     merges = []
-    vocab = {index:bytes(resolve(index)) for index in range(256)} 
-    for merge_index in (range(vocab_size - 256)):
+    vocab = {index:bytes(special_token.encode('utf-8')) for index, special_token in enumerate(special_tokens)}
+    offset = len(vocab)
+    for index in range(256):
+        vocab[offset+index] = bytes(resolve(index))
+    base_vocab_size = len(vocab) 
+    for merge_index in (range(vocab_size - 256 - len(special_tokens))):
         if len(pair_heap) == 0:
             break
         
         # LAZY DELETE: ensure top of the heap is valid((pair_heap[0][1] in pair_map)
         while not heap_entry_valid(pair_heap[0],pair_map):
+            # print ("invalid - popping ", pair_heap[0])
             heapq.heappop(pair_heap)
+
+        # print (f'------ {merge_index}')
+        # for line in peek_top_pairs(pair_heap, pair_map):
+        #     print(line)
+        # print ("--------")
 
         # find the highest frequency entry that is lexographically largest
         degenerate_stack = []
@@ -90,7 +118,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
         
         lex_sort = sorted(degenerate_stack, key=lambda heap_entry: tuple(bytes(decode([index])) for index in heap_entry[1]))
         most_frequent_pair = lex_sort[-1] #grab the largest
-        new_pair_index = 256 + merge_index
+        new_pair_index = base_vocab_size + merge_index
         merges_dict[new_pair_index] = most_frequent_pair[1]
         merges.append(tuple(bytes(resolve(p)) for p in most_frequent_pair[1]))
         vocab[new_pair_index] = bytes(resolve(new_pair_index))
@@ -99,22 +127,22 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
             heapq.heappush(pair_heap,pair)
         
         # print ('most frequent pair ', most_frequent_pair[1],':', pair_map[most_frequent_pair[1]])
-        pair_map_additive_diff = {}
+        pair_map_diff = {}
         for i in range(len(pretokens)):
             pretokens[i], created, destroyed = mergebpairs(pretokens[i],most_frequent_pair[1],new_pair_index)
+            # collect changes for all pretokens
             for pair in created:
-                pair_map_additive_diff[pair] = pair_map_additive_diff.get(pair,0) + pretoken_freq[i]
-            # remove the destroyed pairs from pair_map 
+                pair_map_diff[pair] = pair_map_diff.get(pair,0) + pretoken_freq[i]
             for pair in destroyed:
-                if pair in pair_map:
-                    pair_map[pair] -= pretoken_freq[i]
-                if pair in pair_map and pair_map[pair] == 0:
-                    del pair_map[pair]
-    
-        for new_pair in pair_map_additive_diff:
-            updated_frequency = pair_map.get(new_pair,0) + pair_map_additive_diff[new_pair]
-            pair_map[new_pair] = updated_frequency
-            heapq.heappush(pair_heap,(-updated_frequency,new_pair))
+                pair_map_diff[pair] = pair_map_diff.get(pair,0) - pretoken_freq[i]
+        # update affected pairs for aggregated diff:
+        for pair in pair_map_diff:
+            updated_frequency = pair_map.get(pair,0) + pair_map_diff[pair]
+            if updated_frequency == 0 and pair in pair_map:
+                del pair_map[pair]
+            else:
+                pair_map[pair] = updated_frequency
+                heapq.heappush(pair_heap,(-updated_frequency,pair))
     return vocab, merges
 
 
