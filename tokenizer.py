@@ -1,11 +1,11 @@
 import regex as re
 import heapq
-from tqdm import tqdm
 import joblib
 
 # lifting pretokenizer regex from tiktoken
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 merges_dict = {}
+
 
 ## helper functions
 def pair_decode(pair, pair_map):
@@ -44,15 +44,6 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
         -> len(merges)+len(special_tokens) = len(vocab)-256,
         vocab will have special tokens in the beginning
     """
-
-    # special_tokens = ["<|endoftext|>", "<|padding|>", "<|mask|>"]
-    # pattern = "|".join(special_tokens)
-    # pattern = "|".join(re.escape(tok) for tok in special_tokens)
-
-    # freq = {} # pretoken frequency map - find set of all unique pretokens and their frequencies
-    # for chunk in process_chunks(input_path):
-    #     for token in re.findall(PAT, re.sub(pattern," ",chunk.decode('utf-8'))):
-    #         freq[token] = freq.get(token,0) + 1
     pattern = "|".join(re.escape(tok) for tok in special_tokens)
 
     freq = {}  # pretoken frequency map
@@ -86,10 +77,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
     # deleting from the heap is to maintain the heap property.
 
     merges = []
-    vocab = {i : bytes(resolve(i)) for i in range(256)}
-    offset = len(vocab)
-    for index in range(len(special_tokens)):
-        vocab[offset + index] = bytes(special_tokens[index].encode("utf-8"))
+    vocab = {i: bytes(resolve(i)) for i in range(256)}
     base_vocab_size = len(vocab)
     for merge_index in range(vocab_size - 256 - len(special_tokens)):
         if len(pair_heap) == 0:
@@ -99,7 +87,6 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
         while not heap_entry_valid(pair_heap[0], pair_map):
             # print ("invalid - popping ", pair_heap[0])
             heapq.heappop(pair_heap)
-
 
         # find the highest frequency entry that is lexographically largest
         degenerate_stack = []
@@ -143,6 +130,10 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
             else:
                 pair_map[pair] = updated_frequency
                 heapq.heappush(pair_heap, (-updated_frequency, pair))
+    # and finally add special tokens.
+    offset = len(vocab)
+    for index in range(len(special_tokens)):
+        vocab[offset + index] = bytes(special_tokens[index].encode("utf-8"))
     return vocab, merges
 
 
@@ -249,53 +240,74 @@ def decode(tokens: list[int]):
     # breaks down a list of tokens into base representation
     return [bt for resolved in [resolve(index) for index in tokens] for bt in resolved]
 
+
 class Tokenizer:
-    def __init__(self, vocab: dict[int,bytes], merges:list[tuple[bytes,bytes]], special_tokens :list[str] | None = None,):
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ):
         if special_tokens is None:
             self.special_tokens = []
         else:
             self.special_tokens = special_tokens
         self.vocab = vocab
         self.merges = merges
-        self.bytes_to_id = {v: k for k, v in vocab.items()}
-        self.merge_to_vocab = lambda merge_index : 256 + merge_index + len(self.special_tokens)
-        self.merge_dict = {tuple(self.bytes_to_id[b] for b in pair): self.merge_to_vocab(i) for i, pair in enumerate(self.merges)}
-        self.cache = {} # pretoken:str -> list[int] 
-    
+        self.bytes_to_id = {v: k for k, v in self.vocab.items()}
+        self.merge_dict = {
+            tuple([self.bytes_to_id[bytes(b)] for b in merge]): self.bytes_to_id[b"".join(merge)] for merge in merges
+        }
+        self.cache = {}  # pretoken:str -> list[int]
+
     @classmethod
     def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
         # alternate constructor that passes joblib files from disk
         vocab_from_file = joblib.load(vocab_filepath)
         merges_from_file = joblib.load(merges_filepath)
         return cls(vocab_from_file, merges_from_file, special_tokens)
-    
-    def encode_iterable(self,iterable):
-        for item in iterable:
-            yield self.encode(item)
 
-    def encode_pass(self,ids:list[int]):
-        min_index = float('inf')
+    def encode_iterable(self, iterable):
+        for item in iterable:
+            yield from self.encode(item)
+
+    def encode_pass(self, ids: list[int]):
+        min_index = float("inf")
         next_merge = None
-        for i in range(len(ids)-1):
-            pair = (ids[i],ids[i+1])
-            vocab_index = self.merge_dict.get(pair,None)
+        for i in range(len(ids) - 1):
+            pair = (ids[i], ids[i + 1])
+            vocab_index = self.merge_dict.get(pair, None)
             if vocab_index and vocab_index < min_index:
                 min_index = vocab_index
-                next_merge = (pair, vocab_index) # replace i,i+1 with merge_index
-        return next_merge # a tuple of pair(tuple of ints) and token index created by merge 
-    
-    def encode(self,pretoken:str):
+                next_merge = (pair, vocab_index)  # replace i,i+1 with merge_index
+        return next_merge  # a tuple of pair(tuple of ints) and token index created by merge
+
+    def encode(self, text_input: str):
+        # pattern = "(" + "|".join(re.escape(s) for s in self.special_tokens) + ")"
+        # sort in length - if a special token contains another one as a prefix, we do not parse it short
+        pattern = "(" + "|".join(re.escape(s) for s in sorted(self.special_tokens, key=len, reverse=True)) + ")"
+        segments = re.split(pattern, text_input) if self.special_tokens else [text_input]
+        ids = []
+        for segment in segments:
+            if segment in self.special_tokens:
+                ids += [self.bytes_to_id[segment.encode("utf-8")]]
+            else:
+                for pretoken in re.findall(PAT, segment):
+                    ids.extend(self.encode_pretoken(pretoken))
+        return ids
+
+    def encode_pretoken(self, pretoken: str):
         if pretoken in self.cache:
             return self.cache[pretoken]
         # pretoken_l = list(pretoken.encode('utf-8'))
-        pretoken_l = [self.bytes_to_id[bytes([b])] for b in pretoken.encode('utf-8')]
+        pretoken_l = [self.bytes_to_id[bytes([b])] for b in pretoken.encode("utf-8")]
         next_merge = self.encode_pass(pretoken_l)
         while next_merge:
-            pretoken_l = mergebpairs(pretoken_l,*next_merge,track_diff=False)
+            pretoken_l = mergebpairs(pretoken_l, *next_merge, track_diff=False)
             next_merge = self.encode_pass(pretoken_l)
         if pretoken not in self.cache:
             self.cache[pretoken] = pretoken_l
         return pretoken_l
-    
+
     def decode(self, ids: list[int]):
-        return b''.join([self.vocab[id] for id in ids]).decode('utf-8', errors='replace')
+        return b"".join([self.vocab[id] for id in ids]).decode("utf-8", errors="replace")
