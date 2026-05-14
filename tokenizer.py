@@ -1,14 +1,13 @@
 import regex as re
 import heapq
 from tqdm import tqdm
+import joblib
 
 # lifting pretokenizer regex from tiktoken
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 merges_dict = {}
 
 ## helper functions
-
-
 def pair_decode(pair, pair_map):
     """Return 'freq  (a, b)  (b'x', b'y')' for a pair."""
     freq = pair_map.get(pair, 0)
@@ -42,6 +41,8 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
         merges: list[tuple[bytes, bytes]]  A list of BPE merges produced from training. Each list
         item is a tuple of bytes (<token1>, <token2>), representing that <token1> was merged with
         <token2>. The merges should be ordered by order of creation.
+        -> len(merges)+len(special_tokens) = len(vocab)-256,
+        vocab will have special tokens in the beginning
     """
 
     # special_tokens = ["<|endoftext|>", "<|padding|>", "<|mask|>"]
@@ -85,10 +86,10 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
     # deleting from the heap is to maintain the heap property.
 
     merges = []
-    vocab = {index: bytes(special_token.encode("utf-8")) for index, special_token in enumerate(special_tokens)}
+    vocab = {i : bytes(resolve(i)) for i in range(256)}
     offset = len(vocab)
-    for index in range(256):
-        vocab[offset + index] = bytes(resolve(index))
+    for index in range(len(special_tokens)):
+        vocab[offset + index] = bytes(special_tokens[index].encode("utf-8"))
     base_vocab_size = len(vocab)
     for merge_index in range(vocab_size - 256 - len(special_tokens)):
         if len(pair_heap) == 0:
@@ -99,10 +100,6 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
             # print ("invalid - popping ", pair_heap[0])
             heapq.heappop(pair_heap)
 
-        # print (f'------ {merge_index}')
-        # for line in peek_top_pairs(pair_heap, pair_map):
-        #     print(line)
-        # print ("--------")
 
         # find the highest frequency entry that is lexographically largest
         degenerate_stack = []
@@ -180,16 +177,34 @@ def process_chunks(path, chunksize=2**16, special_token="<|endoftext|>"):
                 yield delimited
 
 
-def mergebpairs(pretoken: list, pair: tuple, new_index: int):
-    # given a pair we want to merge, it returns:
-    #   the pretoken with merges_dict applied,
-    #   pairs to be added,
-    #   pairs to be removed from the frequency map
+def mergebpairs(pretoken: list, pair: tuple, new_index: int, track_diff: bool = True):
+    """Apply a single BPE merge to a pretoken, replacing every adjacent occurrence
+    of ``pair`` with ``new_index``.
+
+    Input
+        pretoken: list[int]  The pretoken as a list of token ids (bytes or merged ids).
+        pair: tuple[int, int]  The adjacent pair of token ids to merge.
+        new_index: int  The token id that replaces every occurrence of ``pair``.
+        track_diff: bool  When True (default), also compute the pairs created and
+            destroyed by this merge so the caller can update its pair frequency map
+            incrementally. When False, skip building these lists and return empty
+            lists in their place — useful when the caller does not need the diff
+            (e.g. tokenizer encoding) and wants to avoid the bookkeeping overhead.
+
+    Output
+        pretoken: list[int]  The pretoken after the merge has been applied.
+        to_add: list[tuple[int, int]]  Pairs newly created by the merge (each
+            occurrence contributes one entry). Empty when ``track_diff`` is False.
+        to_remove: list[tuple[int, int]]  Pairs destroyed by the merge, including
+            one entry of ``pair`` itself for every occurrence merged. Empty when
+            ``track_diff`` is False.
+    """
     if not pair:
         return pretoken
     else:
-        to_add = []
-        to_remove = []
+        if track_diff:
+            to_add = []
+            to_remove = []
         i = 0
         while i < len(pretoken):
             if i < len(pretoken) - 1 and pair[0] == pretoken[i] and pair[1] == pretoken[i + 1]:
@@ -197,16 +212,22 @@ def mergebpairs(pretoken: list, pair: tuple, new_index: int):
                 right = []
                 if i > 0:  # has left
                     left = pretoken[:i]
-                    to_remove.append((pretoken[i - 1], pretoken[i]))
-                    to_add.append((pretoken[i - 1], new_index))
+                    if track_diff:
+                        to_remove.append((pretoken[i - 1], pretoken[i]))
+                        to_add.append((pretoken[i - 1], new_index))
                 if i + 2 < len(pretoken):  # has right
                     right = pretoken[i + 2 :]
-                    to_remove.append((pretoken[i + 1], pretoken[i + 2]))
-                    to_add.append((new_index, pretoken[i + 2]))
-                to_remove.append(pair)
+                    if track_diff:
+                        to_remove.append((pretoken[i + 1], pretoken[i + 2]))
+                        to_add.append((new_index, pretoken[i + 2]))
+                if track_diff:
+                    to_remove.append(pair)
                 pretoken = left + [new_index] + right
             i += 1
-        return pretoken, to_add, to_remove
+        if track_diff:
+            return pretoken, to_add, to_remove
+        else:
+            return pretoken
 
 
 def heap_entry_valid(heap_entry: tuple, pair_map: dict):
@@ -227,3 +248,54 @@ def resolve(index: int):
 def decode(tokens: list[int]):
     # breaks down a list of tokens into base representation
     return [bt for resolved in [resolve(index) for index in tokens] for bt in resolved]
+
+class Tokenizer:
+    def __init__(self, vocab: dict[int,bytes], merges:list[tuple[bytes,bytes]], special_tokens :list[str] | None = None,):
+        if special_tokens is None:
+            self.special_tokens = []
+        else:
+            self.special_tokens = special_tokens
+        self.vocab = vocab
+        self.merges = merges
+        self.bytes_to_id = {v: k for k, v in vocab.items()}
+        self.merge_to_vocab = lambda merge_index : 256 + merge_index + len(self.special_tokens)
+        self.merge_dict = {tuple(self.bytes_to_id[b] for b in pair): self.merge_to_vocab(i) for i, pair in enumerate(self.merges)}
+        self.cache = {} # pretoken:str -> list[int] 
+    
+    @classmethod
+    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
+        # alternate constructor that passes joblib files from disk
+        vocab_from_file = joblib.load(vocab_filepath)
+        merges_from_file = joblib.load(merges_filepath)
+        return cls(vocab_from_file, merges_from_file, special_tokens)
+    
+    def encode_iterable(self,iterable):
+        for item in iterable:
+            yield self.encode(item)
+
+    def encode_pass(self,ids:list[int]):
+        min_index = float('inf')
+        next_merge = None
+        for i in range(len(ids)-1):
+            pair = (ids[i],ids[i+1])
+            vocab_index = self.merge_dict.get(pair,None)
+            if vocab_index and vocab_index < min_index:
+                min_index = vocab_index
+                next_merge = (pair, vocab_index) # replace i,i+1 with merge_index
+        return next_merge # a tuple of pair(tuple of ints) and token index created by merge 
+    
+    def encode(self,pretoken:str):
+        if pretoken in self.cache:
+            return self.cache[pretoken]
+        # pretoken_l = list(pretoken.encode('utf-8'))
+        pretoken_l = [self.bytes_to_id[bytes([b])] for b in pretoken.encode('utf-8')]
+        next_merge = self.encode_pass(pretoken_l)
+        while next_merge:
+            pretoken_l = mergebpairs(pretoken_l,*next_merge,track_diff=False)
+            next_merge = self.encode_pass(pretoken_l)
+        if pretoken not in self.cache:
+            self.cache[pretoken] = pretoken_l
+        return pretoken_l
+    
+    def decode(self, ids: list[int]):
+        return b''.join([self.vocab[id] for id in ids]).decode('utf-8', errors='replace')
