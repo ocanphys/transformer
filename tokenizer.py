@@ -1,6 +1,12 @@
-import regex as re
 import heapq
+import logging
+import os
+
 import joblib
+import regex as re
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 # lifting pretokenizer regex from tiktoken
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -47,12 +53,16 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
     pattern = "|".join(re.escape(tok) for tok in special_tokens)
 
     freq = {}  # pretoken frequency map
-    for chunk in process_chunks(input_path):
-        text = chunk.decode("utf-8")
-        segments = re.split(pattern, text) if pattern else [text]
-        for segment in segments:
-            for token in re.findall(PAT, segment):
-                freq[token] = freq.get(token, 0) + 1
+    with tqdm(
+        total=os.path.getsize(input_path), desc="pretokenizing and building frequency map", unit="B", unit_scale=True
+    ) as pbar:
+        for chunk in process_chunks(input_path):
+            text = chunk.decode("utf-8")
+            segments = re.split(pattern, text) if pattern else [text]
+            for segment in segments:
+                for token in re.findall(PAT, segment):
+                    freq[token] = freq.get(token, 0) + 1
+            pbar.update(len(chunk))
 
     pretoken_str, pretoken_freq = zip(*freq.items())
     pretokens = [list(pretoken.encode("utf-8")) for pretoken in pretoken_str]
@@ -79,7 +89,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
     merges = []
     vocab = {i: bytes(resolve(i)) for i in range(256)}
     base_vocab_size = len(vocab)
-    for merge_index in range(vocab_size - 256 - len(special_tokens)):
+    for merge_index in tqdm(range(vocab_size - 256 - len(special_tokens)), desc="merging pairs"):
         if len(pair_heap) == 0:
             break
 
