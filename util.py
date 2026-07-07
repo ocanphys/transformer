@@ -106,6 +106,8 @@ class LiveLossPlot:
         self.figsize = figsize
         self.title = title
         self.losses: list[float] = []
+        self.val_steps: list[int] = []
+        self.val_losses: list[float] = []
 
     def __enter__(self):
         import matplotlib.pyplot as plt
@@ -114,11 +116,13 @@ class LiveLossPlot:
         # ioff prevents auto-display so we only render via the display handle
         with plt.ioff():
             self.fig, self.ax = plt.subplots(figsize=self.figsize)
-        (self.line,) = self.ax.plot([], [])
+        (self.line,) = self.ax.plot([], [], label="train")
+        (self.val_line,) = self.ax.plot([], [], color="tab:orange", marker="o", label="val")
         self.ax.set_xlabel("iteration")
         self.ax.set_ylabel("loss")
         self.ax.set_title(self.title)
         self.ax.grid(True, alpha=0.3)
+        self.ax.legend(loc="upper right")
         self._dh = display(self.fig, display_id=True)  # reserve an output slot we can overwrite
         return self
 
@@ -127,8 +131,15 @@ class LiveLossPlot:
         if (len(self.losses) - 1) % self.every == 0:
             self._redraw()
 
+    def log_val(self, loss: float) -> None:
+        """Record a validation loss at the current training step index."""
+        self.val_steps.append(len(self.losses) - 1)
+        self.val_losses.append(loss)
+        self._redraw()
+
     def _redraw(self) -> None:
         self.line.set_data(range(len(self.losses)), self.losses)
+        self.val_line.set_data(self.val_steps, self.val_losses)
         self.ax.relim()
         self.ax.autoscale_view()
         self._dh.update(self.fig)
