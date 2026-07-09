@@ -1,6 +1,9 @@
+import importlib
+import json
 import logging
 import os
 import torch
+from datetime import datetime
 from pathlib import Path
 import numpy as np
 import requests
@@ -31,7 +34,9 @@ def configure_logging(level: int = logging.INFO) -> None:
     root.setLevel(level)
 
 
-def download_and_concat(urls: list[str], output_path: str, separator: str = "\n") -> Path:
+def download_and_concat(
+    urls: list[str], output_path: str, separator: str = "\n"
+) -> Path:
     """
     Download text files from URLs and concatenate them into a single file.
 
@@ -58,8 +63,9 @@ def download_and_concat(urls: list[str], output_path: str, separator: str = "\n"
     logger.info("wrote %s (%s bytes)", out, f"{out.stat().st_size:,}")
 
 
-
-def textfile_to_tokens_as_binary(source_text,binary_target, tokenizer: Tokenizer, binary_file_mode= "wb"):
+def textfile_to_tokens_as_binary(
+    source_text, binary_target, tokenizer: Tokenizer, binary_file_mode="wb"
+):
     """
     converts a text file into a raw binary file that can be used as memmap
     for training - we are using uint16 which supports vocab size 2^16 max
@@ -67,6 +73,7 @@ def textfile_to_tokens_as_binary(source_text,binary_target, tokenizer: Tokenizer
     target = "data/train.bin"
     textfile_to_tokens_as_binary(source_text=source, binary_target=target)
     """
+
     def batched(it, n):
         it = iter(it)
         while batch := list(islice(it, n)):
@@ -74,8 +81,15 @@ def textfile_to_tokens_as_binary(source_text,binary_target, tokenizer: Tokenizer
 
     total_bytes = os.path.getsize(source_text)
     # iterable that returns lines from the text file
-    with open(source_text, "r") as source_file, \
-         tqdm(total=total_bytes, unit="B", unit_scale=True, desc=f"tokenizing {source_text}") as pbar:
+    with (
+        open(source_text, "r") as source_file,
+        tqdm(
+            total=total_bytes,
+            unit="B",
+            unit_scale=True,
+            desc=f"tokenizing {source_text}",
+        ) as pbar,
+    ):
 
         def tracked_lines():
             for line in source_file:
@@ -89,32 +103,259 @@ def textfile_to_tokens_as_binary(source_text,binary_target, tokenizer: Tokenizer
                 np.array(chunk, dtype=np.uint16).tofile(target_file)
 
 
-def get_batch(data: np.ndarray, batch_size: int, context_length: int,
-              device: torch.device | str = 'cpu'):
+def get_batch(
+    data: np.ndarray,
+    batch_size: int,
+    context_length: int,
+    seed: int,
+    step: int,
+    device: torch.device | str = "cpu",
+):
     high = len(data) - context_length
-    starts = np.random.randint(0, high, size=batch_size)
+    rng = np.random.default_rng((seed, step))
+    starts = rng.integers(0, high, size=batch_size)
     # cast on the numpy side - Embedding needs long
-    inputs  = np.stack([data[i:i+context_length]     for i in starts]).astype(np.int64)
-    targets = np.stack([data[i+1:i+context_length+1] for i in starts]).astype(np.int64)
+    inputs = np.stack([data[i : i + context_length] for i in starts]).astype(np.int64)
+    targets = np.stack([data[i + 1 : i + context_length + 1] for i in starts]).astype(
+        np.int64
+    )
     return torch.from_numpy(inputs).to(device), torch.from_numpy(targets).to(device)
 
 
-def save_checkpoint(model, optimizer, iteration, out):
-    out = Path(out)
+def seed_everything(seed: int) -> None:
+    """Seed every RNG that affects model initialization (weights in every
+    Linear/Embedding/MultiHeadAttention/SwiGLU), on both CPU and CUDA."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def make_run_dir(description: str, seed: int) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    d = Path("runs") / f"{timestamp}_{description}_{seed}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def checkpoint_path(run_directory: Path, iteration: int) -> Path:
+    return run_directory / "checkpoints" / f"step_{iteration:010d}.obj"
+
+
+def latest_checkpoint_path(run_directory: Path) -> Path | None:
+    checkpoints = sorted((run_directory / "checkpoints").glob("step_*.obj"))
+    return checkpoints[-1] if checkpoints else None
+
+
+def class_ref(cls: type) -> str:
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def resolve_class_ref(ref: str | type) -> type:
+    if isinstance(ref, type):
+        return ref
+    module_name, _, qualname = ref.rpartition(".")
+    return getattr(importlib.import_module(module_name), qualname)
+
+
+def resolve_config(config: dict) -> dict:
+    """Normalize a raw config dict -- whether freshly built with live class refs
+    and torch types, or just read back from config.json with string-encoded ones
+    -- into one that's ready to use directly everywhere: config["model_class"]/
+    config["optimizer_class"] as real classes, config["model_params"]["dtype"] as
+    a torch.dtype, config["optimizer_params"]["betas"] as a tuple.
+    """
+    resolved = dict(config)
+    resolved["model_class"] = resolve_class_ref(config["model_class"])
+    resolved["optimizer_class"] = resolve_class_ref(config["optimizer_class"])
+
+    model_params = dict(config["model_params"])
+    dtype = model_params.get("dtype")
+    model_params["dtype"] = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+    resolved["model_params"] = model_params
+
+    optimizer_params = dict(config["optimizer_params"])
+    if "betas" in optimizer_params:
+        optimizer_params["betas"] = tuple(optimizer_params["betas"])
+    resolved["optimizer_params"] = optimizer_params
+
+    return resolved
+
+
+def strip_optimizer_state(checkpoint_file: Path) -> None:
+    """Rewrite a checkpoint file in place, dropping its optimizer state while
+    keeping the model weights. No-op if the file has no optimizer state.
+    """
+    checkpoint = torch.load(checkpoint_file, map_location="cpu")
+    if checkpoint["optimizer"] is None:
+        return
+    checkpoint["optimizer"] = None
+    torch.save(checkpoint, checkpoint_file)
+
+
+def save_checkpoint(
+    model, optimizer, iteration, seed, run_directory, keep_optimizer_history=False
+):
+    """Save a new checkpoint under `run_directory`.
+
+    Adam's optimizer state roughly doubles checkpoint size and is only ever
+    needed from the latest checkpoint to resume training. So by default, once
+    the new checkpoint is written, the previous latest checkpoint's optimizer
+    state is stripped (its model weights are kept). Pass keep_optimizer_history=True
+    to preserve full optimizer state in every checkpoint.
+    """
+    run_directory = Path(run_directory)
+    prev = latest_checkpoint_path(run_directory)
+
+    out = checkpoint_path(run_directory, iteration)
     out.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint = {
-        "iteration": iteration,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-    }
-    torch.save(checkpoint, out)
+    torch.save(
+        {
+            "iteration": iteration,
+            "seed": seed,
+            "model": model.state_dict() if model is not None else None,
+            "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        },
+        out,
+    )
+
+    if not keep_optimizer_history and prev is not None:
+        strip_optimizer_state(prev)
 
 
-def load_checkpoint(src, model, optimizer):
-    checkpoint = torch.load(src)
-    model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    return checkpoint["iteration"]
+def append_log(
+    run_directory: Path, step: int, loss: float, val_loss: float | None
+) -> None:
+    with open(run_directory / "log.jsonl", "a") as f:
+        f.write(json.dumps({"step": step, "loss": loss, "val_loss": val_loss}) + "\n")
+
+
+def run_training(
+    config_or_run_dir: dict | Path,
+    save_on_exit: bool = True,
+    keep_optimizer_history: bool = False,
+):
+    """Pass a config dict to always start a brand-new run, or an existing run's
+    Path (as returned by a previous call) to continue it -- safe to call again
+    after a crash/interrupt, and a no-op once total_iterations is reached.
+
+    save_on_exit: when True (default), a checkpoint is written in `finally` even
+    if the loop is interrupted or raises, so a later call can resume from the
+    last completed step. Set False to skip that save (only the periodic
+    `save_every` checkpoints will exist).
+
+    keep_optimizer_history: when False (default), each new checkpoint strips
+    the optimizer state from the previous one (keeping its model weights) to
+    save disk space, since only the latest checkpoint's optimizer state is
+    ever needed to resume training. Set True to keep full optimizer state in
+    every checkpoint.
+    """
+    if isinstance(config_or_run_dir, dict):
+        config = config_or_run_dir
+        rdir = make_run_dir(
+            config["description"], config["seed"]
+        )  # always a fresh folder
+        serializable = {
+            **config,
+            "model_class": class_ref(config["model_class"]),
+            "optimizer_class": class_ref(config["optimizer_class"]),
+        }
+        (rdir / "config.json").write_text(json.dumps(serializable, indent=2))
+        save_checkpoint(
+            None,
+            None,
+            iteration=0,
+            seed=config["seed"],
+            run_directory=rdir,
+            keep_optimizer_history=keep_optimizer_history,
+        )
+    else:
+        rdir = Path(config_or_run_dir)
+        config = json.loads((rdir / "config.json").read_text())
+
+    config = resolve_config(config)
+    train_cfg = config["training"]
+    device = config["model_params"]["device"]
+    seed = config["seed"]
+
+    checkpoint = torch.load(latest_checkpoint_path(rdir), map_location=device)
+    iteration = checkpoint["iteration"]
+
+    if checkpoint["model"] is None:
+        seed_everything(seed)  # reproducible init weights
+
+    model = config["model_class"](**config["model_params"])  # fails loudly on model/config mismatch; already on `device`
+    optimizer = config["optimizer_class"](model.parameters(), **config["optimizer_params"])
+
+    if checkpoint["model"] is not None:
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+
+    train_data = np.memmap(train_cfg["train_path"], dtype=np.uint16, mode="r")
+    valid_data = np.memmap(train_cfg["valid_path"], dtype=np.uint16, mode="r")
+    loss_function = torch.nn.CrossEntropyLoss()
+    context_length = config["model_params"]["context_length"]
+
+    pbar = tqdm(
+        range(iteration, train_cfg["total_iterations"]),
+        desc=rdir,
+        colour="white",
+    )
+    step = iteration - 1
+    try:
+        for step in pbar:
+            model.train()
+            inputs, targets = get_batch(
+                train_data,
+                train_cfg["batch_size"],
+                context_length,
+                seed=seed,
+                step=step,
+                device=device,
+            )
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = loss_function(outputs.transpose(1, 2), targets)
+            loss.backward()
+            optimizer.step()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            val_loss = None
+            if step % train_cfg["val_every"] == 0:
+                model.eval()
+                with torch.no_grad():
+                    vi, vt = get_batch(
+                        valid_data,
+                        train_cfg["batch_size"],
+                        context_length,
+                        seed=seed,
+                        step=step,
+                        device=device,
+                    )
+                    val_loss = loss_function(model(vi).transpose(1, 2), vt).item()
+
+            append_log(rdir, step, loss.item(), val_loss)
+
+            if (step + 1) % train_cfg["save_every"] == 0:
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    step + 1,
+                    seed,
+                    rdir,
+                    keep_optimizer_history=keep_optimizer_history,
+                )
+    finally:
+        if save_on_exit and step >= iteration:  # at least one step actually ran
+            save_checkpoint(
+                model,
+                optimizer,
+                step + 1,
+                seed,
+                rdir,
+                keep_optimizer_history=keep_optimizer_history,
+            )
+
+    return model, optimizer, rdir
 
 
 class LiveLossPlot:
@@ -129,8 +370,13 @@ class LiveLossPlot:
     Requires `%matplotlib widget` (ipympl) in the notebook for live updates.
     """
 
-    def __init__(self, every: int = 10, figsize: tuple[int, int] = (10, 4),
-                 title: str = "Training loss (live)", text_color: str = "white"):
+    def __init__(
+        self,
+        every: int = 10,
+        figsize: tuple[int, int] = (10, 4),
+        title: str = "Training loss (live)",
+        text_color: str = "white",
+    ):
         self.every = every
         self.figsize = figsize
         self.title = title
@@ -159,7 +405,9 @@ class LiveLossPlot:
         self.ax.title.set_color(self.text_color)
 
         (self.line,) = self.ax.plot([], [], label="train")
-        (self.val_line,) = self.ax.plot([], [], color="tab:orange", marker="o", label="val")
+        (self.val_line,) = self.ax.plot(
+            [], [], color="tab:orange", marker="o", label="val"
+        )
         self.ax.set_xlabel("iteration")
         self.ax.set_ylabel("loss")
         self.ax.set_title(self.title)
@@ -168,7 +416,9 @@ class LiveLossPlot:
         legend.get_frame().set_alpha(0)
         for text in legend.get_texts():
             text.set_color(self.text_color)
-        self._dh = display(self.fig, display_id=True)  # reserve an output slot we can overwrite
+        self._dh = display(
+            self.fig, display_id=True
+        )  # reserve an output slot we can overwrite
         return self
 
     def log(self, loss: float, iteration: int) -> None:
@@ -194,7 +444,7 @@ class LiveLossPlot:
         import matplotlib.pyplot as plt
 
         del exc_type, exc_val, exc_tb
-        self._redraw()       # final paint so the last few steps show up
+        self._redraw()  # final paint so the last few steps show up
         plt.close(self.fig)  # prevent a duplicate render at cell end
         return False
 
@@ -202,14 +452,31 @@ class LiveLossPlot:
 class LMDataLoader(torch.utils.data.IterableDataset):
     """Infinite random-batch loader over a uint16 token memmap."""
 
-    def __init__(self, path: str, batch_size: int, context_length: int,
-                 device: torch.device | str = "cpu"):
+    def __init__(
+        self,
+        path: str,
+        batch_size: int,
+        context_length: int,
+        seed: int = 0,
+        step: int = 0,
+        device: torch.device | str = "cpu",
+    ):
         self.path = path
         self.batch_size = batch_size
         self.context_length = context_length
+        self.seed = seed
+        self.step = step
         self.device = device
 
     def __iter__(self):
         data = np.memmap(self.path, dtype=np.uint16, mode="r")
         while True:
-            yield get_batch(data, self.batch_size, self.context_length, self.device)
+            yield get_batch(
+                data,
+                self.batch_size,
+                self.context_length,
+                seed=self.seed,
+                step=self.step,
+                device=self.device,
+            )
+            self.step += 1
