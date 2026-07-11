@@ -3,7 +3,8 @@ import json
 import logging
 import os
 import torch
-from datetime import datetime
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 import requests
@@ -146,27 +147,33 @@ def latest_checkpoint_path(run_directory: Path) -> Path | None:
     return checkpoints[-1] if checkpoints else None
 
 
-def class_ref(cls: type) -> str:
-    return f"{cls.__module__}.{cls.__qualname__}"
+def import_ref(obj: type | Callable) -> str:
+    """Encode a class or top-level function as an importable "module.qualname"
+    string, so it round-trips through config.json."""
+    return f"{obj.__module__}.{obj.__qualname__}"
 
 
-def resolve_class_ref(ref: str | type) -> type:
-    if isinstance(ref, type):
+def resolve_import_ref(ref):
+    """Inverse of import_ref. Passes through anything that isn't a string
+    (e.g. already a live class/function, as when config is freshly built)."""
+    if not isinstance(ref, str):
         return ref
     module_name, _, qualname = ref.rpartition(".")
     return getattr(importlib.import_module(module_name), qualname)
 
 
 def resolve_config(config: dict) -> dict:
-    """Normalize a raw config dict -- whether freshly built with live class refs
-    and torch types, or just read back from config.json with string-encoded ones
-    -- into one that's ready to use directly everywhere: config["model_class"]/
-    config["optimizer_class"] as real classes, config["model_params"]["dtype"] as
-    a torch.dtype, config["optimizer_params"]["betas"] as a tuple.
+    """Normalize a raw config dict -- whether freshly built with live class/
+    function refs and torch types, or just read back from config.json with
+    string-encoded ones -- into one that's ready to use directly everywhere:
+    config["model_class"]/config["optimizer_class"]/config["lr_schedule_fn"]
+    as real classes/functions, config["model_params"]["dtype"] as a
+    torch.dtype, config["optimizer_params"]["betas"] as a tuple.
     """
     resolved = dict(config)
-    resolved["model_class"] = resolve_class_ref(config["model_class"])
-    resolved["optimizer_class"] = resolve_class_ref(config["optimizer_class"])
+    resolved["model_class"] = resolve_import_ref(config["model_class"])
+    resolved["optimizer_class"] = resolve_import_ref(config["optimizer_class"])
+    resolved["lr_schedule_fn"] = resolve_import_ref(config["lr_schedule_fn"])
 
     model_params = dict(config["model_params"])
     dtype = model_params.get("dtype")
@@ -223,10 +230,64 @@ def save_checkpoint(
 
 
 def append_log(
-    run_directory: Path, step: int, loss: float, val_loss: float | None
+    run_directory: Path, step: int, loss: float, val_loss: float | None, lr: float
 ) -> None:
-    with open(run_directory / "log.jsonl", "a") as f:
-        f.write(json.dumps({"step": step, "loss": loss, "val_loss": val_loss}) + "\n")
+    # Z-suffixed UTC timestamp: parses directly with JS `new Date(...)` and
+    # converts unambiguously to any viewer's local timezone in a UI.
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+    with open(run_directory / "train.jsonl", "a") as f:
+        f.write(
+            json.dumps(
+                {
+                    "step": step,
+                    "loss": loss,
+                    "val_loss": val_loss,
+                    "lr": lr,
+                    "timestamp": timestamp,
+                }
+            )
+            + "\n"
+        )
+
+
+def write_run_summary(run_directory: Path, config: dict, final_iteration: int) -> None:
+    """Write summary.json capturing the run's final state. Reads the full
+    train.jsonl history (which spans every resume of this run) rather than
+    just what happened in the current call, so stats stay accurate across
+    interrupted/resumed runs.
+    """
+    run_directory = Path(run_directory)
+    log_file = run_directory / "train.jsonl"
+    rows = (
+        [json.loads(line) for line in log_file.read_text().splitlines()]
+        if log_file.exists()
+        else []
+    )
+    val_rows = [r for r in rows if r["val_loss"] is not None]
+    total_iterations = config["training"]["total_iterations"]
+
+    best_train_row = min(rows, key=lambda r: r["loss"], default=None)
+    best_val_row = min(val_rows, key=lambda r: r["val_loss"], default=None)
+
+    summary = {
+        "run_directory": str(run_directory),
+        "description": config.get("description"),
+        "seed": config.get("seed"),
+        "final_iteration": final_iteration,
+        "total_iterations": total_iterations,
+        "completed": final_iteration >= total_iterations,
+        "final_train_loss": rows[-1]["loss"] if rows else None,
+        "final_val_loss": val_rows[-1]["val_loss"] if val_rows else None,
+        "best_train_loss": best_train_row["loss"] if best_train_row else None,
+        "best_train_loss_step": best_train_row["step"] if best_train_row else None,
+        "best_val_loss": best_val_row["val_loss"] if best_val_row else None,
+        "best_val_loss_step": best_val_row["step"] if best_val_row else None,
+        "started_at": rows[0]["timestamp"] if rows else None,
+        "ended_at": rows[-1]["timestamp"] if rows else None,
+    }
+    (run_directory / "summary.json").write_text(json.dumps(summary, indent=2))
 
 
 def run_training(
@@ -256,8 +317,9 @@ def run_training(
         )  # always a fresh folder
         serializable = {
             **config,
-            "model_class": class_ref(config["model_class"]),
-            "optimizer_class": class_ref(config["optimizer_class"]),
+            "model_class": import_ref(config["model_class"]),
+            "optimizer_class": import_ref(config["optimizer_class"]),
+            "lr_schedule_fn": import_ref(config["lr_schedule_fn"]),
         }
         (rdir / "config.json").write_text(json.dumps(serializable, indent=2))
         save_checkpoint(
@@ -276,6 +338,8 @@ def run_training(
     train_cfg = config["training"]
     device = config["model_params"]["device"]
     seed = config["seed"]
+    lr_schedule_fn = config["lr_schedule_fn"]
+    lr_schedule_params = config["lr_schedule_params"]
 
     checkpoint = torch.load(latest_checkpoint_path(rdir), map_location=device)
     iteration = checkpoint["iteration"]
@@ -297,7 +361,7 @@ def run_training(
 
     pbar = tqdm(
         range(iteration, train_cfg["total_iterations"]),
-        desc=rdir,
+        desc=str(rdir),
         colour="white",
     )
     step = iteration - 1
@@ -312,12 +376,24 @@ def run_training(
                 step=step,
                 device=device,
             )
+            # lr_schedule_fn returns a single scalar lr, applied uniformly to
+            # every param group (there's only ever one lr in this implementation)
+            lr = lr_schedule_fn(step, **lr_schedule_params)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = loss_function(outputs.transpose(1, 2), targets)
             loss.backward()
             optimizer.step()
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            if device == "mps":
+                # optimizer.step()'s in-place param updates are queued
+                # asynchronously on MPS; without this, the eval forward below
+                # can read partially-written weights and produce degenerate
+                # (near-uniform) output.
+                torch.mps.synchronize()
+            pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}")
 
             val_loss = None
             if step % train_cfg["val_every"] == 0:
@@ -333,7 +409,7 @@ def run_training(
                     )
                     val_loss = loss_function(model(vi).transpose(1, 2), vt).item()
 
-            append_log(rdir, step, loss.item(), val_loss)
+            append_log(rdir, step, loss.item(), val_loss, lr)
 
             if (step + 1) % train_cfg["save_every"] == 0:
                 save_checkpoint(
@@ -354,6 +430,8 @@ def run_training(
                 rdir,
                 keep_optimizer_history=keep_optimizer_history,
             )
+        final_iteration = step + 1 if step >= iteration else iteration
+        write_run_summary(rdir, config, final_iteration)
 
     return model, optimizer, rdir
 
