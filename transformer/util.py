@@ -2,6 +2,7 @@ import importlib
 import json
 import logging
 import os
+import traceback
 import torch
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ import numpy as np
 import requests
 from itertools import islice
 from tqdm import tqdm
-from tokenizer import Tokenizer
+from transformer.tokenizer import Tokenizer
 
 
 logger = logging.getLogger(__name__)
@@ -364,6 +365,10 @@ def run_training(
         desc=str(rdir),
         colour="white",
     )
+    # `step` is defined BEFORE the try so the except/finally below can always read
+    # it, even if we're interrupted or error out on the very first iteration (before
+    # the loop variable is otherwise assigned). `iteration - 1` means "no step
+    # completed yet", which the `step >= iteration` guards below rely on.
     step = iteration - 1
     try:
         for step in pbar:
@@ -420,7 +425,27 @@ def run_training(
                     rdir,
                     keep_optimizer_history=keep_optimizer_history,
                 )
+    except BaseException as exc:
+        # Catch EVERYTHING here -- Ctrl-C (KeyboardInterrupt), device/runtime errors
+        # (e.g. an MPS/CUDA RuntimeError), and ordinary bugs all match, because we
+        # catch BaseException (the ROOT of the hierarchy), not just Exception.
+        # We log + print the exception but deliberately do NOT re-raise: that stops
+        # it propagating, so the `finally` below can hand back the most recent model.
+        # NOTE: this intentionally hides the failure from the caller -- the log/print
+        # here is the ONLY signal that the run ended early instead of completing.
+        logging.exception(
+            "run_training: training loop exited via exception at step %d", step
+        )
+        print(
+            f"[run_training] exception at step {step}: {exc!r} "
+            f"-- returning most recent checkpoint"
+        )
+        traceback.print_exc()
     finally:
+        # Runs on EVERY exit path: normal loop completion OR the caught exception
+        # above. The `return` at the end of this block is the function's single exit
+        # for all of those paths -- a `return` inside `finally` is exactly what makes
+        # "always hand back the latest model, no matter what" work.
         if save_on_exit and step >= iteration:  # at least one step actually ran
             save_checkpoint(
                 model,
@@ -432,8 +457,11 @@ def run_training(
             )
         final_iteration = step + 1 if step >= iteration else iteration
         write_run_summary(rdir, config, final_iteration)
-
-    return model, optimizer, rdir
+        # `return` inside `finally`: the function's exit for every path (clean finish
+        # or caught exception). Because it lives in `finally`, it also swallows any
+        # exception that were somehow still pending -- intended here, but the reason a
+        # stray failure can vanish silently, hence the logging/print in `except`.
+        return model, optimizer, rdir
 
 
 class LiveLossPlot:
