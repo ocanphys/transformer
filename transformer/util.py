@@ -37,7 +37,7 @@ def configure_logging(level: int = logging.INFO) -> None:
     root.setLevel(level)
 
 
-def download_and_concat(urls: list[str], output_path: str, separator: str = "\n") -> Path:
+def download_and_concat(urls: list[str], output_path: str, volume: Path, separator: str = "\n") -> Path:
     """
     Download text files from URLs and concatenate them into a single file.
 
@@ -49,7 +49,7 @@ def download_and_concat(urls: list[str], output_path: str, separator: str = "\n"
     Returns:
         Path object of the written file.
     """
-    out = Path(output_path)
+    out = volume / Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
     with open(out, "w", encoding="utf-8") as f:
@@ -69,37 +69,45 @@ def prepare_tokenizer(
     vocab_size: int,
     special_tokens: list[str],
     raw_text_path: str,
-    tokenizers_dir: str = "tokenizers",
+    volume: Path,
 ) -> Path:
     """Train a BPE tokenizer and write tokenizers/{tokenizer_uid}/tokenizer.joblib
     (vocab + merges) and config.json (special_tokens, vocab_size, raw_text_path),
-    loadable back via Tokenizer.from_files(tokenizer_uid, tokenizers_dir).
+    loadable back via Tokenizer.from_files(tokenizer_uid, volume).
+
+    raw_text_path is relative to volume (e.g. "data/train.txt"), same as everything
+    else volume-scoped -- so the same call reproduces identically regardless of
+    which volume (local or the Modal Volume mount) it's run against.
 
     Always retrains and overwrites -- no check for an existing tokenizer_uid.
     """
-    vocab, merges = train_bpe(raw_text_path, vocab_size, special_tokens)
+    vocab, merges = train_bpe(str(volume / raw_text_path), vocab_size, special_tokens)
 
-    tokenizer_dir = Path(tokenizers_dir) / tokenizer_uid
+    tokenizer_dir = volume / "tokenizers" / tokenizer_uid
     tokenizer_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump((vocab, merges), tokenizer_dir / "tokenizer.joblib")
 
-    config = {
+    tokenizer_config = {
         "special_tokens": special_tokens,
         "vocab_size": vocab_size,
         "raw_text_path": str(raw_text_path),
     }
-    (tokenizer_dir / "config.json").write_text(json.dumps(config, indent=2))
+    (tokenizer_dir / "config.json").write_text(json.dumps(tokenizer_config, indent=2))
     # return tokenizer_dir
 
 
-def textfile_to_tokens_as_binary(source_text, binary_target, tokenizer: Tokenizer, binary_file_mode="wb"):
+def textfile_to_tokens_as_binary(source_text, binary_target, tokenizer: Tokenizer, volume: Path, binary_file_mode="wb"):
     """
     converts a text file into a raw binary file that can be used as memmap
     for training - we are using uint16 which supports vocab size 2^16 max
+    all filepaths are relative to volume/
     source = "data/combined.txt"
     target = "data/train.bin"
     textfile_to_tokens_as_binary(source_text=source, binary_target=target)
     """
+
+    source_text = volume / source_text
+    binary_target = volume / binary_target
 
     def batched(it, n):
         it = iter(it)
@@ -155,9 +163,9 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def make_run_dir(description: str, seed: int) -> Path:
+def make_run_dir(description: str, seed: int, volume: Path) -> Path:
     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    d = Path("runs") / f"{timestamp}_{description}_{seed}"
+    d = volume / "runs" / f"{timestamp}_{description}_{seed}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -270,11 +278,14 @@ def append_log(run_directory: Path, step: int, loss: float, val_loss: float | No
         )
 
 
-def write_run_summary(run_directory: Path, config: dict, final_iteration: int) -> None:
+def write_run_summary(run_directory: Path, config: dict, final_iteration: int, volume: Path) -> None:
     """Write summary.json capturing the run's final state. Reads the full
     train.jsonl history (which spans every resume of this run) rather than
     just what happened in the current call, so stats stay accurate across
     interrupted/resumed runs.
+
+    run_directory is stored relative to volume, same as everything else
+    volume-scoped -- never an absolute path.
     """
     run_directory = Path(run_directory)
     log_file = run_directory / "train.jsonl"
@@ -286,7 +297,7 @@ def write_run_summary(run_directory: Path, config: dict, final_iteration: int) -
     best_val_row = min(val_rows, key=lambda r: r["val_loss"], default=None)
 
     summary = {
-        "run_directory": str(run_directory),
+        "run_directory": str(run_directory.relative_to(volume)),
         "description": config.get("description"),
         "seed": config.get("seed"),
         "final_iteration": final_iteration,
@@ -306,12 +317,19 @@ def write_run_summary(run_directory: Path, config: dict, final_iteration: int) -
 
 def run_training(
     config_or_run_dir: dict | Path,
+    volume: Path,
     save_on_exit: bool = True,
     keep_optimizer_history: bool = False,
 ):
     """Pass a config dict to always start a brand-new run, or an existing run's
-    Path (as returned by a previous call) to continue it -- safe to call again
-    after a crash/interrupt, and a no-op once total_iterations is reached.
+    Path *relative to volume* (e.g. "runs/20260722T073953_baseline4layer_0") to
+    continue it -- safe to call again after a crash/interrupt, and a no-op once
+    total_iterations is reached.
+
+    config["training"]["train_path"]/["valid_path"] must likewise be relative to
+    volume (e.g. "data/train.bin"), not absolute -- so the same config.json
+    reproduces identically whether run against the local volume or the Modal
+    Volume mount. Nothing in this function is stored as an absolute path.
 
     save_on_exit: when True (default), a checkpoint is written in `finally` even
     if the loop is interrupted or raises, so a later call can resume from the
@@ -326,7 +344,7 @@ def run_training(
     """
     if isinstance(config_or_run_dir, dict):
         config = config_or_run_dir
-        rdir = make_run_dir(config["description"], config["seed"])  # always a fresh folder
+        rdir = make_run_dir(config["description"], config["seed"],volume)  # always a fresh folder
         serializable = {
             **config,
             "model_class": import_ref(config["model_class"]),
@@ -343,7 +361,7 @@ def run_training(
             keep_optimizer_history=keep_optimizer_history,
         )
     else:
-        rdir = Path(config_or_run_dir)
+        rdir = volume / Path(config_or_run_dir)  # config_or_run_dir is relative to volume
         config = json.loads((rdir / "config.json").read_text())
 
     config = resolve_config(config)
@@ -368,8 +386,8 @@ def run_training(
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
 
-    train_data = np.memmap(train_cfg["train_path"], dtype=np.uint16, mode="r")
-    valid_data = np.memmap(train_cfg["valid_path"], dtype=np.uint16, mode="r")
+    train_data = np.memmap(volume / train_cfg["train_path"], dtype=np.uint16, mode="r")
+    valid_data = np.memmap(volume / train_cfg["valid_path"], dtype=np.uint16, mode="r")
     loss_function = torch.nn.CrossEntropyLoss()
     context_length = config["model_params"]["context_length"]
 
@@ -464,7 +482,7 @@ def run_training(
                 keep_optimizer_history=keep_optimizer_history,
             )
         final_iteration = step + 1 if step >= iteration else iteration
-        write_run_summary(rdir, config, final_iteration)
+        write_run_summary(rdir, config, final_iteration, volume)
         # `return` inside `finally`: the function's exit for every path (clean finish
         # or caught exception). Because it lives in `finally`, it also swallows any
         # exception that were somehow still pending -- intended here, but the reason a

@@ -277,13 +277,14 @@ class Tokenizer:
         self.cache = {}  # pretoken:str -> list[int]
 
     @classmethod
-    def from_files(cls, tokenizer_uid, tokenizers_dir="tokenizers"):
-        """Recover a Tokenizer from tokenizers/{tokenizer_uid}/tokenizer.joblib
-        (vocab + merges) and config.json (special_tokens, vocab_size, raw_text_path)."""
-        tokenizer_dir = Path(tokenizers_dir) / tokenizer_uid
+    def from_files(cls, tokenizer_uid, volume):
+        """Recover a Tokenizer from volume/tokenizers/{tokenizer_uid}/tokenizer.joblib
+        (vocab + merges) and config.json (special_tokens, vocab_size, raw_text_path).
+        "tokenizers" is always relative to volume, same as everywhere else volume-scoped."""
+        tokenizer_dir = Path(volume) / "tokenizers" / tokenizer_uid
         vocab, merges = joblib.load(tokenizer_dir / "tokenizer.joblib")
-        config = json.loads((tokenizer_dir / "config.json").read_text())
-        return cls(vocab, merges, config.get("special_tokens"))
+        tokenizer_config = json.loads((tokenizer_dir / "config.json").read_text())
+        return cls(vocab, merges, tokenizer_config.get("special_tokens"))
 
     def encode_iterable(self, iterable):
         for item in iterable:
