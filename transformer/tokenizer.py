@@ -1,6 +1,8 @@
 import heapq
+import json
 import logging
 import os
+from pathlib import Path
 
 import joblib
 import regex as re
@@ -92,9 +94,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
     merges = []
     vocab = {i: bytes(resolve(i)) for i in range(256)}
     base_vocab_size = len(vocab)
-    for merge_index in tqdm(
-        range(vocab_size - 256 - len(special_tokens)), desc="merging pairs"
-    ):
+    for merge_index in tqdm(range(vocab_size - 256 - len(special_tokens)), desc="merging pairs"):
         if len(pair_heap) == 0:
             break
 
@@ -118,9 +118,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
 
         lex_sort = sorted(
             degenerate_stack,
-            key=lambda heap_entry: tuple(
-                bytes(decode([index])) for index in heap_entry[1]
-            ),
+            key=lambda heap_entry: tuple(bytes(decode([index])) for index in heap_entry[1]),
         )
         most_frequent_pair = lex_sort[-1]  # grab the largest
         new_pair_index = base_vocab_size + merge_index
@@ -134,9 +132,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
         # print ('most frequent pair ', most_frequent_pair[1],':', pair_map[most_frequent_pair[1]])
         pair_map_diff = {}
         for i in range(len(pretokens)):
-            pretokens[i], created, destroyed = mergebpairs(
-                pretokens[i], most_frequent_pair[1], new_pair_index
-            )
+            pretokens[i], created, destroyed = mergebpairs(pretokens[i], most_frequent_pair[1], new_pair_index)
             # collect changes for all pretokens
             for pair in created:
                 pair_map_diff[pair] = pair_map_diff.get(pair, 0) + pretoken_freq[i]
@@ -218,11 +214,7 @@ def mergebpairs(pretoken: list, pair: tuple, new_index: int, track_diff: bool = 
             to_remove = []
         i = 0
         while i < len(pretoken):
-            if (
-                i < len(pretoken) - 1
-                and pair[0] == pretoken[i]
-                and pair[1] == pretoken[i + 1]
-            ):
+            if i < len(pretoken) - 1 and pair[0] == pretoken[i] and pair[1] == pretoken[i + 1]:
                 left = []
                 right = []
                 if i > 0:  # has left
@@ -257,11 +249,7 @@ def resolve(index: int):
     if index < 256 or index not in merges_dict:
         return [index]
     else:
-        return [
-            item
-            for sublist in [resolve(children) for children in merges_dict[index]]
-            for item in sublist
-        ]
+        return [item for sublist in [resolve(children) for children in merges_dict[index]] for item in sublist]
 
 
 def decode(tokens: list[int]):
@@ -284,19 +272,18 @@ class Tokenizer:
         self.merges = merges
         self.bytes_to_id = {v: k for k, v in self.vocab.items()}
         self.merge_dict = {
-            tuple([self.bytes_to_id[bytes(b)] for b in merge]): self.bytes_to_id[
-                b"".join(merge)
-            ]
-            for merge in merges
+            tuple([self.bytes_to_id[bytes(b)] for b in merge]): self.bytes_to_id[b"".join(merge)] for merge in merges
         }
         self.cache = {}  # pretoken:str -> list[int]
 
     @classmethod
-    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
-        # alternate constructor that passes joblib files from disk
-        vocab_from_file = joblib.load(vocab_filepath)
-        merges_from_file = joblib.load(merges_filepath)
-        return cls(vocab_from_file, merges_from_file, special_tokens)
+    def from_files(cls, tokenizer_uid, tokenizers_dir="tokenizers"):
+        """Recover a Tokenizer from tokenizers/{tokenizer_uid}/tokenizer.joblib
+        (vocab + merges) and config.json (special_tokens, vocab_size, raw_text_path)."""
+        tokenizer_dir = Path(tokenizers_dir) / tokenizer_uid
+        vocab, merges = joblib.load(tokenizer_dir / "tokenizer.joblib")
+        config = json.loads((tokenizer_dir / "config.json").read_text())
+        return cls(vocab, merges, config.get("special_tokens"))
 
     def encode_iterable(self, iterable):
         for item in iterable:
@@ -316,16 +303,8 @@ class Tokenizer:
     def encode(self, text_input: str):
         # pattern = "(" + "|".join(re.escape(s) for s in self.special_tokens) + ")"
         # sort in length - if a special token contains another one as a prefix, we do not parse it short
-        pattern = (
-            "("
-            + "|".join(
-                re.escape(s) for s in sorted(self.special_tokens, key=len, reverse=True)
-            )
-            + ")"
-        )
-        segments = (
-            re.split(pattern, text_input) if self.special_tokens else [text_input]
-        )
+        pattern = "(" + "|".join(re.escape(s) for s in sorted(self.special_tokens, key=len, reverse=True)) + ")"
+        segments = re.split(pattern, text_input) if self.special_tokens else [text_input]
         ids = []
         for segment in segments:
             if segment in self.special_tokens:
@@ -349,6 +328,4 @@ class Tokenizer:
         return pretoken_l
 
     def decode(self, ids: list[int]):
-        return b"".join([self.vocab[id] for id in ids]).decode(
-            "utf-8", errors="replace"
-        )
+        return b"".join([self.vocab[id] for id in ids]).decode("utf-8", errors="replace")
