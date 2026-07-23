@@ -6,6 +6,7 @@ from transformer.optimizer import AdamW, lr_cosine_schedule
 from transformer.util import (
     configure_logging,
     download_and_concat,
+    prepare_tokenizer,
     run_training,
     textfile_to_tokens_as_binary,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "lr_cosine_schedule",
     "configure_logging",
     "download_and_concat",
+    "prepare_tokenizer",
     "run_training",
     "textfile_to_tokens_as_binary",
 ]

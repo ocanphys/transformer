@@ -42,9 +42,7 @@ class AdamW(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure=None):
-        loss = (
-            None if closure is None else closure()
-        )  # API convention - not really used.
+        loss = None if closure is None else closure()  # API convention - not really used.
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
@@ -54,11 +52,7 @@ class AdamW(torch.optim.Optimizer):
                 m = state.get("m", torch.zeros_like(p))
                 v = state.get("v", torch.zeros_like(p))
                 # correction to moving averages to betas are absorbed into learning rate
-                lr_adj = (
-                    group["lr"]
-                    * (1 - group["beta2"] ** t) ** 0.5
-                    / (1 - group["beta1"] ** t)
-                )
+                lr_adj = group["lr"] * (1 - group["beta2"] ** t) ** 0.5 / (1 - group["beta1"] ** t)
                 # using lr_adj vs lr is a choice -
                 ## in place multiply: rather than p.data = p.data*(1-...)
                 p.data.mul_(1 - group["lr"] * group["lambda_wd"])  # weight decay
@@ -70,9 +64,7 @@ class AdamW(torch.optim.Optimizer):
         return loss
 
 
-def lr_cosine_schedule(
-    t, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters
-):
+def lr_cosine_schedule(t, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters):
     if t < warmup_iters:
         return t * max_learning_rate / warmup_iters
     if t > cosine_cycle_iters:
@@ -80,12 +72,7 @@ def lr_cosine_schedule(
     else:
         return (
             min_learning_rate
-            + (
-                1
-                + math.cos(
-                    (t - warmup_iters) * math.pi / (cosine_cycle_iters - warmup_iters)
-                )
-            )
+            + (1 + math.cos((t - warmup_iters) * math.pi / (cosine_cycle_iters - warmup_iters)))
             * (max_learning_rate - min_learning_rate)
             / 2.0
         )
@@ -94,9 +81,7 @@ def lr_cosine_schedule(
 def gradient_clip(parameters, max_norm, eps=1e-6):
     with torch.no_grad():
         parameters = [p for p in parameters if p.grad is not None]
-        total_norm = torch.linalg.vector_norm(
-            torch.concat([param.grad.flatten() for param in parameters])
-        )
+        total_norm = torch.linalg.vector_norm(torch.concat([param.grad.flatten() for param in parameters]))
         if total_norm > max_norm:
             for param in parameters:
                 param.grad.mul_(max_norm / (total_norm + eps))

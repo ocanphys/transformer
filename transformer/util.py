@@ -7,11 +7,12 @@ import torch
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+import joblib
 import numpy as np
 import requests
 from itertools import islice
 from tqdm import tqdm
-from transformer.tokenizer import Tokenizer
+from transformer.tokenizer import Tokenizer, train_bpe
 
 
 logger = logging.getLogger(__name__)
@@ -36,9 +37,7 @@ def configure_logging(level: int = logging.INFO) -> None:
     root.setLevel(level)
 
 
-def download_and_concat(
-    urls: list[str], output_path: str, separator: str = "\n"
-) -> Path:
+def download_and_concat(urls: list[str], output_path: str, separator: str = "\n") -> Path:
     """
     Download text files from URLs and concatenate them into a single file.
 
@@ -65,9 +64,35 @@ def download_and_concat(
     logger.info("wrote %s (%s bytes)", out, f"{out.stat().st_size:,}")
 
 
-def textfile_to_tokens_as_binary(
-    source_text, binary_target, tokenizer: Tokenizer, binary_file_mode="wb"
-):
+def prepare_tokenizer(
+    tokenizer_uid: str,
+    vocab_size: int,
+    special_tokens: list[str],
+    raw_text_path: str,
+    tokenizers_dir: str = "tokenizers",
+) -> Path:
+    """Train a BPE tokenizer and write tokenizers/{tokenizer_uid}/tokenizer.joblib
+    (vocab + merges) and config.json (special_tokens, vocab_size, raw_text_path),
+    loadable back via Tokenizer.from_files(tokenizer_uid, tokenizers_dir).
+
+    Always retrains and overwrites -- no check for an existing tokenizer_uid.
+    """
+    vocab, merges = train_bpe(raw_text_path, vocab_size, special_tokens)
+
+    tokenizer_dir = Path(tokenizers_dir) / tokenizer_uid
+    tokenizer_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump((vocab, merges), tokenizer_dir / "tokenizer.joblib")
+
+    config = {
+        "special_tokens": special_tokens,
+        "vocab_size": vocab_size,
+        "raw_text_path": str(raw_text_path),
+    }
+    (tokenizer_dir / "config.json").write_text(json.dumps(config, indent=2))
+    # return tokenizer_dir
+
+
+def textfile_to_tokens_as_binary(source_text, binary_target, tokenizer: Tokenizer, binary_file_mode="wb"):
     """
     converts a text file into a raw binary file that can be used as memmap
     for training - we are using uint16 which supports vocab size 2^16 max
@@ -118,9 +143,7 @@ def get_batch(
     starts = rng.integers(0, high, size=batch_size)
     # cast on the numpy side - Embedding needs long
     inputs = np.stack([data[i : i + context_length] for i in starts]).astype(np.int64)
-    targets = np.stack([data[i + 1 : i + context_length + 1] for i in starts]).astype(
-        np.int64
-    )
+    targets = np.stack([data[i + 1 : i + context_length + 1] for i in starts]).astype(np.int64)
     return torch.from_numpy(inputs).to(device), torch.from_numpy(targets).to(device)
 
 
@@ -200,9 +223,7 @@ def strip_optimizer_state(checkpoint_file: Path) -> None:
     torch.save(checkpoint, checkpoint_file)
 
 
-def save_checkpoint(
-    model, optimizer, iteration, seed, run_directory, keep_optimizer_history=False
-):
+def save_checkpoint(model, optimizer, iteration, seed, run_directory, keep_optimizer_history=False):
     """Save a new checkpoint under `run_directory`.
 
     Adam's optimizer state roughly doubles checkpoint size and is only ever
@@ -230,14 +251,10 @@ def save_checkpoint(
         strip_optimizer_state(prev)
 
 
-def append_log(
-    run_directory: Path, step: int, loss: float, val_loss: float | None, lr: float
-) -> None:
+def append_log(run_directory: Path, step: int, loss: float, val_loss: float | None, lr: float) -> None:
     # Z-suffixed UTC timestamp: parses directly with JS `new Date(...)` and
     # converts unambiguously to any viewer's local timezone in a UI.
-    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
-        "+00:00", "Z"
-    )
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     with open(run_directory / "train.jsonl", "a") as f:
         f.write(
             json.dumps(
@@ -261,11 +278,7 @@ def write_run_summary(run_directory: Path, config: dict, final_iteration: int) -
     """
     run_directory = Path(run_directory)
     log_file = run_directory / "train.jsonl"
-    rows = (
-        [json.loads(line) for line in log_file.read_text().splitlines()]
-        if log_file.exists()
-        else []
-    )
+    rows = [json.loads(line) for line in log_file.read_text().splitlines()] if log_file.exists() else []
     val_rows = [r for r in rows if r["val_loss"] is not None]
     total_iterations = config["training"]["total_iterations"]
 
@@ -313,9 +326,7 @@ def run_training(
     """
     if isinstance(config_or_run_dir, dict):
         config = config_or_run_dir
-        rdir = make_run_dir(
-            config["description"], config["seed"]
-        )  # always a fresh folder
+        rdir = make_run_dir(config["description"], config["seed"])  # always a fresh folder
         serializable = {
             **config,
             "model_class": import_ref(config["model_class"]),
@@ -348,7 +359,9 @@ def run_training(
     if checkpoint["model"] is None:
         seed_everything(seed)  # reproducible init weights
 
-    model = config["model_class"](**config["model_params"])  # fails loudly on model/config mismatch; already on `device`
+    model = config["model_class"](
+        **config["model_params"]
+    )  # fails loudly on model/config mismatch; already on `device`
     optimizer = config["optimizer_class"](model.parameters(), **config["optimizer_params"])
 
     if checkpoint["model"] is not None:
@@ -433,13 +446,8 @@ def run_training(
         # it propagating, so the `finally` below can hand back the most recent model.
         # NOTE: this intentionally hides the failure from the caller -- the log/print
         # here is the ONLY signal that the run ended early instead of completing.
-        logging.exception(
-            "run_training: training loop exited via exception at step %d", step
-        )
-        print(
-            f"[run_training] exception at step {step}: {exc!r} "
-            f"-- returning most recent checkpoint"
-        )
+        logging.exception("run_training: training loop exited via exception at step %d", step)
+        print(f"[run_training] exception at step {step}: {exc!r} -- returning most recent checkpoint")
         traceback.print_exc()
     finally:
         # Runs on EVERY exit path: normal loop completion OR the caught exception
@@ -511,9 +519,7 @@ class LiveLossPlot:
         self.ax.title.set_color(self.text_color)
 
         (self.line,) = self.ax.plot([], [], label="train")
-        (self.val_line,) = self.ax.plot(
-            [], [], color="tab:orange", marker="o", label="val"
-        )
+        (self.val_line,) = self.ax.plot([], [], color="tab:orange", marker="o", label="val")
         self.ax.set_xlabel("iteration")
         self.ax.set_ylabel("loss")
         self.ax.set_title(self.title)
@@ -522,9 +528,7 @@ class LiveLossPlot:
         legend.get_frame().set_alpha(0)
         for text in legend.get_texts():
             text.set_color(self.text_color)
-        self._dh = display(
-            self.fig, display_id=True
-        )  # reserve an output slot we can overwrite
+        self._dh = display(self.fig, display_id=True)  # reserve an output slot we can overwrite
         return self
 
     def log(self, loss: float, iteration: int) -> None:
