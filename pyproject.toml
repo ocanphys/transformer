@@ -25,6 +25,7 @@ dependencies = [
     "ipympl>=0.10.0",
     "scikit-learn>=1.9.0",
     "pandas>=3.0.3",
+    "modal>=1.5.2",
 ]
 
 [build-system]
