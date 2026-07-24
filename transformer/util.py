@@ -2,7 +2,6 @@ import importlib
 import json
 import logging
 import os
-import traceback
 import torch
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -170,8 +169,8 @@ def make_run_dir(description: str, seed: int, volume: Path) -> Path:
     return d
 
 
-def checkpoint_path(run_directory: Path, iteration: int) -> Path:
-    return run_directory / "checkpoints" / f"step_{iteration:010d}.obj"
+def checkpoint_path(run_directory: Path, step: int) -> Path:
+    return run_directory / "checkpoints" / f"step_{step:010d}.obj"
 
 
 def latest_checkpoint_path(run_directory: Path) -> Path | None:
@@ -231,8 +230,16 @@ def strip_optimizer_state(checkpoint_file: Path) -> None:
     torch.save(checkpoint, checkpoint_file)
 
 
-def save_checkpoint(model, optimizer, iteration, seed, run_directory, keep_optimizer_history=False):
-    """Save a new checkpoint under `run_directory`.
+def save_checkpoint(model, optimizer, step, attempt, seed, run_directory, keep_optimizer_history=False):
+    """Save a new checkpoint under `run_directory`, at `step` (step 0 is the
+    initial checkpoint, right after model/optimizer construction and before
+    any training has happened; step N is the state after the Nth training
+    step has fully completed).
+
+    attempt: which continuous execution produced this checkpoint -- 1 for a
+    fresh run, incremented by 1 every time run_training picks up from an
+    existing checkpoint instead of starting at step 0. Persisted so a run's
+    history can be split back into its distinct attempts later.
 
     Adam's optimizer state roughly doubles checkpoint size and is only ever
     needed from the latest checkpoint to resume training. So by default, once
@@ -243,23 +250,24 @@ def save_checkpoint(model, optimizer, iteration, seed, run_directory, keep_optim
     run_directory = Path(run_directory)
     prev = latest_checkpoint_path(run_directory)
 
-    out = checkpoint_path(run_directory, iteration)
+    out = checkpoint_path(run_directory, step)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "iteration": iteration,
+            "step": step,
+            "attempt": attempt,
             "seed": seed,
-            "model": model.state_dict() if model is not None else None,
-            "optimizer": optimizer.state_dict() if optimizer is not None else None,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
         },
         out,
     )
 
-    if not keep_optimizer_history and prev is not None:
+    if not keep_optimizer_history and prev is not None and prev != out:
         strip_optimizer_state(prev)
 
 
-def append_log(run_directory: Path, step: int, loss: float, val_loss: float | None, lr: float) -> None:
+def append_log(run_directory: Path, step: int, attempt: int, loss: float, val_loss: float | None, lr: float) -> None:
     # Z-suffixed UTC timestamp: parses directly with JS `new Date(...)` and
     # converts unambiguously to any viewer's local timezone in a UI.
     timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -268,6 +276,7 @@ def append_log(run_directory: Path, step: int, loss: float, val_loss: float | No
             json.dumps(
                 {
                     "step": step,
+                    "attempt": attempt,
                     "loss": loss,
                     "val_loss": val_loss,
                     "lr": lr,
@@ -278,7 +287,7 @@ def append_log(run_directory: Path, step: int, loss: float, val_loss: float | No
         )
 
 
-def write_run_summary(run_directory: Path, config: dict, final_iteration: int, volume: Path) -> None:
+def write_run_summary(run_directory: Path, config: dict, final_step: int, volume: Path) -> None:
     """Write summary.json capturing the run's final state. Reads the full
     train.jsonl history (which spans every resume of this run) rather than
     just what happened in the current call, so stats stay accurate across
@@ -300,9 +309,9 @@ def write_run_summary(run_directory: Path, config: dict, final_iteration: int, v
         "run_directory": str(run_directory.relative_to(volume)),
         "description": config.get("description"),
         "seed": config.get("seed"),
-        "final_iteration": final_iteration,
+        "final_step": final_step,
         "total_iterations": total_iterations,
-        "completed": final_iteration >= total_iterations,
+        "completed": final_step >= total_iterations,
         "final_train_loss": rows[-1]["loss"] if rows else None,
         "final_val_loss": val_rows[-1]["val_loss"] if val_rows else None,
         "best_train_loss": best_train_row["loss"] if best_train_row else None,
@@ -318,23 +327,50 @@ def write_run_summary(run_directory: Path, config: dict, final_iteration: int, v
 def run_training(
     config_or_run_dir: dict | Path,
     volume: Path,
-    save_on_exit: bool = True,
     keep_optimizer_history: bool = False,
 ):
     """Pass a config dict to always start a brand-new run, or an existing run's
     Path *relative to volume* (e.g. "runs/20260722T073953_baseline4layer_0") to
-    continue it -- safe to call again after a crash/interrupt, and a no-op once
-    total_iterations is reached.
+    continue it -- safe to call again, and a no-op once total_iterations is
+    reached.
+
+    Steps only, no separate "iteration" concept: step 0 is the initial
+    checkpoint (model/optimizer state right after construction, before any
+    training happens); step N is the state after the Nth training step has
+    fully completed. Resuming always continues from (latest checkpoint's
+    step) + 1.
+
+    No try/except around the training loop: a checkpoint is only ever written
+    once a step has fully finished, so if training is interrupted (Ctrl-C, a
+    crash, anything) partway through a step, nothing is saved for that
+    in-progress step and nothing claims it completed. Resuming restarts at the
+    last real checkpoint -- no silently-skipped steps, no half-applied weight
+    update ever persisted as if it were done. The tradeoff: an interrupted
+    call raises instead of always handing back a model.
+
+    Every checkpoint and every train.jsonl row also carries `attempt`: 1 for a
+    fresh run, incremented by 1 each time this function picks up from an
+    existing checkpoint instead of starting at step 0. A run's full history
+    (across every crash/resume) lives in one train.jsonl, so `attempt` is what
+    lets you cleanly split it back into its distinct continuous executions
+    afterward, e.g. to sanity-check that loss didn't jump at an attempt
+    boundary.
 
     config["training"]["train_path"]/["valid_path"] must likewise be relative to
-    volume (e.g. "data/train.bin"), not absolute -- so the same config.json
-    reproduces identically whether run against the local volume or the Modal
-    Volume mount. Nothing in this function is stored as an absolute path.
+    volume (e.g. "data/{dataset_name}/bin/{tokenizer_uid}/train.bin"), not
+    absolute -- so the same config.json reproduces identically whether run
+    against the local volume or the Modal Volume mount. Nothing in this
+    function is stored as an absolute path.
 
-    save_on_exit: when True (default), a checkpoint is written in `finally` even
-    if the loop is interrupted or raises, so a later call can resume from the
-    last completed step. Set False to skip that save (only the periodic
-    `save_every` checkpoints will exist).
+    tokenizer_uid isn't a separate config field -- it's read off train_path's
+    parent directory name (the {tokenizer_uid} path segment above), since that's
+    already the single source of truth for which tokenizer produced these bins;
+    duplicating it into config would just be a second place for it to go stale.
+    For a fresh run (config is a dict), this is validated before anything else
+    runs: train_path/valid_path must exist under volume, and
+    config["model_params"]["vocab_size"] must match that tokenizer's own
+    config.json vocab_size -- otherwise this raises immediately rather than
+    starting a doomed run.
 
     keep_optimizer_history: when False (default), each new checkpoint strips
     the optimizer state from the previous one (keeping its model weights) to
@@ -344,6 +380,24 @@ def run_training(
     """
     if isinstance(config_or_run_dir, dict):
         config = config_or_run_dir
+
+        train_path = volume / config["training"]["train_path"]
+        valid_path = volume / config["training"]["valid_path"]
+        if not train_path.exists():
+            raise FileNotFoundError(f"train_path not found: {train_path}")
+        if not valid_path.exists():
+            raise FileNotFoundError(f"valid_path not found: {valid_path}")
+        
+        ## < -This part is tokenizer specific.
+        tokenizer_uid = train_path.parent.name  # data/{dataset_name}/bin/{tokenizer_uid}/{split}.bin
+        tokenizer_config = json.loads((volume / "tokenizers" / tokenizer_uid / "config.json").read_text())
+        if tokenizer_config["vocab_size"] != config["model_params"]["vocab_size"]:
+            raise ValueError(
+                f"model_params.vocab_size ({config['model_params']['vocab_size']}) does not match "
+                f"tokenizer {tokenizer_uid!r}'s vocab_size ({tokenizer_config['vocab_size']})"
+            )
+        ## ->
+        
         rdir = make_run_dir(config["description"], config["seed"], volume)  # always a fresh folder
         serializable = {
             **config,
@@ -352,56 +406,49 @@ def run_training(
             "lr_schedule_fn": import_ref(config["lr_schedule_fn"]),
         }
         (rdir / "config.json").write_text(json.dumps(serializable, indent=2))
-        save_checkpoint(
-            None,
-            None,
-            iteration=0,
-            seed=config["seed"],
-            run_directory=rdir,
-            keep_optimizer_history=keep_optimizer_history,
-        )
+        start_step = 0
     else:
         rdir = volume / Path(config_or_run_dir)  # config_or_run_dir is relative to volume
         config = json.loads((rdir / "config.json").read_text())
+        start_step = None  # resolved below, from the latest checkpoint
 
     config = resolve_config(config)
     train_cfg = config["training"]
+    total_iterations = train_cfg["total_iterations"]
     device = config["model_params"]["device"]
     seed = config["seed"]
     lr_schedule_fn = config["lr_schedule_fn"]
     lr_schedule_params = config["lr_schedule_params"]
 
-    checkpoint = torch.load(latest_checkpoint_path(rdir), map_location=device)
-    iteration = checkpoint["iteration"]
-
-    if checkpoint["model"] is None:
-        seed_everything(seed)  # reproducible init weights
+    if start_step == 0:
+        seed_everything(seed)  # reproducible init weights -- must happen before construction below
 
     model = config["model_class"](
         **config["model_params"]
     )  # fails loudly on model/config mismatch; already on `device`
     optimizer = config["optimizer_class"](model.parameters(), **config["optimizer_params"])
 
-    if checkpoint["model"] is not None:
+    if start_step == 0:
+        attempt = 1
+        save_checkpoint(model, optimizer, 0, attempt, seed, rdir, keep_optimizer_history=keep_optimizer_history)
+    else:
+        checkpoint = torch.load(latest_checkpoint_path(rdir), map_location=device)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        start_step = checkpoint["step"]
+        attempt = checkpoint["attempt"] + 1  # picking up from a checkpoint -- a new attempt
 
     train_data = np.memmap(volume / train_cfg["train_path"], dtype=np.uint16, mode="r")
     valid_data = np.memmap(volume / train_cfg["valid_path"], dtype=np.uint16, mode="r")
     loss_function = torch.nn.CrossEntropyLoss()
     context_length = config["model_params"]["context_length"]
 
-    pbar = tqdm(
-        range(iteration, train_cfg["total_iterations"]),
-        desc=str(rdir),
-        colour="white",
-    )
-    # `step` is defined BEFORE the try so the except/finally below can always read
-    # it, even if we're interrupted or error out on the very first iteration (before
-    # the loop variable is otherwise assigned). `iteration - 1` means "no step
-    # completed yet", which the `step >= iteration` guards below rely on.
-    step = iteration - 1
-    try:
+    if start_step < total_iterations:
+        pbar = tqdm(
+            range(start_step + 1, total_iterations + 1),
+            desc=str(rdir),
+            colour="white",
+        )
         for step in pbar:
             model.train()
             inputs, targets = get_batch(
@@ -445,49 +492,29 @@ def run_training(
                     )
                     val_loss = loss_function(model(vi).transpose(1, 2), vt).item()
 
-            append_log(rdir, step, loss.item(), val_loss, lr)
+            append_log(rdir, step, attempt, loss.item(), val_loss, lr)
 
-            if (step + 1) % train_cfg["save_every"] == 0:
+            if step % train_cfg["save_every"] == 0:
                 save_checkpoint(
-                    model,
-                    optimizer,
-                    step + 1,
-                    seed,
-                    rdir,
-                    keep_optimizer_history=keep_optimizer_history,
+                    model, optimizer, step, attempt, seed, rdir, keep_optimizer_history=keep_optimizer_history
                 )
-    except BaseException as exc:
-        # Catch EVERYTHING here -- Ctrl-C (KeyboardInterrupt), device/runtime errors
-        # (e.g. an MPS/CUDA RuntimeError), and ordinary bugs all match, because we
-        # catch BaseException (the ROOT of the hierarchy), not just Exception.
-        # We log + print the exception but deliberately do NOT re-raise: that stops
-        # it propagating, so the `finally` below can hand back the most recent model.
-        # NOTE: this intentionally hides the failure from the caller -- the log/print
-        # here is the ONLY signal that the run ended early instead of completing.
-        logging.exception("run_training: training loop exited via exception at step %d", step)
-        print(f"[run_training] exception at step {step}: {exc!r} -- returning most recent checkpoint")
-        traceback.print_exc()
-    finally:
-        # Runs on EVERY exit path: normal loop completion OR the caught exception
-        # above. The `return` at the end of this block is the function's single exit
-        # for all of those paths -- a `return` inside `finally` is exactly what makes
-        # "always hand back the latest model, no matter what" work.
-        if save_on_exit and step >= iteration:  # at least one step actually ran
+
+        # always persist the true final step, even if total_iterations isn't a
+        # clean multiple of save_every -- so a normal, uninterrupted finish
+        # never leaves trained steps unpersisted.
+        if total_iterations % train_cfg["save_every"] != 0:
             save_checkpoint(
                 model,
                 optimizer,
-                step + 1,
+                total_iterations,
+                attempt,
                 seed,
                 rdir,
                 keep_optimizer_history=keep_optimizer_history,
             )
-        final_iteration = step + 1 if step >= iteration else iteration
-        write_run_summary(rdir, config, final_iteration, volume)
-        # `return` inside `finally`: the function's exit for every path (clean finish
-        # or caught exception). Because it lives in `finally`, it also swallows any
-        # exception that were somehow still pending -- intended here, but the reason a
-        # stray failure can vanish silently, hence the logging/print in `except`.
-        return model, optimizer, rdir
+
+    write_run_summary(rdir, config, total_iterations, volume)
+    return model, optimizer, rdir
 
 
 class LiveLossPlot:
