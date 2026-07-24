@@ -344,7 +344,7 @@ def run_training(
     """
     if isinstance(config_or_run_dir, dict):
         config = config_or_run_dir
-        rdir = make_run_dir(config["description"], config["seed"],volume)  # always a fresh folder
+        rdir = make_run_dir(config["description"], config["seed"], volume)  # always a fresh folder
         serializable = {
             **config,
             "model_class": import_ref(config["model_class"]),
