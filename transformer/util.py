@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import torch
+import wandb
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -267,26 +268,6 @@ def save_checkpoint(model, optimizer, step, attempt, seed, run_directory, keep_o
         strip_optimizer_state(prev)
 
 
-def append_log(run_directory: Path, step: int, attempt: int, loss: float, val_loss: float | None, lr: float) -> None:
-    # Z-suffixed UTC timestamp: parses directly with JS `new Date(...)` and
-    # converts unambiguously to any viewer's local timezone in a UI.
-    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    with open(run_directory / "train.jsonl", "a") as f:
-        f.write(
-            json.dumps(
-                {
-                    "step": step,
-                    "attempt": attempt,
-                    "loss": loss,
-                    "val_loss": val_loss,
-                    "lr": lr,
-                    "timestamp": timestamp,
-                }
-            )
-            + "\n"
-        )
-
-
 def write_run_summary(run_directory: Path, config: dict, final_step: int, volume: Path) -> None:
     """Write summary.json capturing the run's final state. Reads the full
     train.jsonl history (which spans every resume of this run) rather than
@@ -327,6 +308,7 @@ def write_run_summary(run_directory: Path, config: dict, final_step: int, volume
 def run_training(
     config_or_run_dir: dict | Path,
     volume: Path,
+    wandb_kwargs: dict | None = None,
     keep_optimizer_history: bool = False,
 ):
     """Pass a config dict to always start a brand-new run, or an existing run's
@@ -372,6 +354,14 @@ def run_training(
     config.json vocab_size -- otherwise this raises immediately rather than
     starting a doomed run.
 
+    wandb_kwargs: when not None (e.g. {} or {"project": ..., "tags": [...]}),
+    also logs to Weights & Biases in addition to train.jsonl (requires
+    WANDB_API_KEY in the environment -- e.g. via a Modal Secret for runs on
+    Modal). Passed straight into wandb.init(...); project/name/tags/entity/etc
+    are entirely the caller's choice. id and resume="allow" are supplied by
+    this function (rdir.name, so every attempt of the same run appends to one
+    wandb run, same as train.jsonl) unless wandb_kwargs overrides them.
+
     keep_optimizer_history: when False (default), each new checkpoint strips
     the optimizer state from the previous one (keeping its model weights) to
     save disk space, since only the latest checkpoint's optimizer state is
@@ -406,10 +396,12 @@ def run_training(
             "lr_schedule_fn": import_ref(config["lr_schedule_fn"]),
         }
         (rdir / "config.json").write_text(json.dumps(serializable, indent=2))
+        config_json = serializable
         start_step = 0
     else:
         rdir = volume / Path(config_or_run_dir)  # config_or_run_dir is relative to volume
         config = json.loads((rdir / "config.json").read_text())
+        config_json = config  # already the JSON form -- resolve_config below rebinds `config`, doesn't mutate this
         start_step = None  # resolved below, from the latest checkpoint
 
     config = resolve_config(config)
@@ -437,6 +429,16 @@ def run_training(
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_step = checkpoint["step"]
         attempt = checkpoint["attempt"] + 1  # picking up from a checkpoint -- a new attempt
+
+    if wandb_kwargs is not None:
+        wandb.init(
+            **{
+                "id": rdir.name,
+                "resume": "allow",
+                "config": config_json,
+                **wandb_kwargs,  # caller wins on any key it explicitly sets
+            }
+        )
 
     train_data = np.memmap(volume / train_cfg["train_path"], dtype=np.uint16, mode="r")
     valid_data = np.memmap(volume / train_cfg["valid_path"], dtype=np.uint16, mode="r")
@@ -492,7 +494,21 @@ def run_training(
                     )
                     val_loss = loss_function(model(vi).transpose(1, 2), vt).item()
 
-            append_log(rdir, step, attempt, loss.item(), val_loss, lr)
+            # Z-suffixed UTC timestamp: parses directly with JS `new Date(...)` and
+            # converts unambiguously to any viewer's local timezone in a UI.
+            row = {
+                "step": step,
+                "attempt": attempt,
+                "loss": loss.item(),
+                "val_loss": val_loss,
+                "lr": lr,
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            }
+            with open(rdir / "train.jsonl", "a") as f:
+                f.write(json.dumps(row) + "\n")
+
+            if wandb_kwargs is not None:
+                wandb.log(row, step=step)
 
             if step % train_cfg["save_every"] == 0:
                 save_checkpoint(
@@ -512,6 +528,9 @@ def run_training(
                 rdir,
                 keep_optimizer_history=keep_optimizer_history,
             )
+
+    if wandb_kwargs is not None:
+        wandb.finish()
 
     write_run_summary(rdir, config, total_iterations, volume)
     return model, optimizer, rdir
