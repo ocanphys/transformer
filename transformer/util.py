@@ -412,6 +412,15 @@ def run_training(
     lr_schedule_fn = config["lr_schedule_fn"]
     lr_schedule_params = config["lr_schedule_params"]
 
+    # Named after rdir, so this call's logs are scoped to this run by
+    # construction -- no shared handler to add/remove, no risk of a later
+    # run_training call in the same process writing into this run's file.
+    run_logger = logging.getLogger(f"{__name__}.{rdir.name}")
+    run_logger.setLevel(logging.INFO)
+    events_handler = logging.FileHandler(rdir / "events.log")
+    events_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    run_logger.addHandler(events_handler)
+
     if start_step == 0:
         seed_everything(seed)  # reproducible init weights -- must happen before construction below
 
@@ -423,12 +432,22 @@ def run_training(
     if start_step == 0:
         attempt = 1
         save_checkpoint(model, optimizer, 0, attempt, seed, rdir, keep_optimizer_history=keep_optimizer_history)
+        run_logger.info(
+            "run_training: starting fresh run %s (attempt %d, %d total steps)", rdir.name, attempt, total_iterations
+        )
     else:
         checkpoint = torch.load(latest_checkpoint_path(rdir), map_location=device)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_step = checkpoint["step"]
         attempt = checkpoint["attempt"] + 1  # picking up from a checkpoint -- a new attempt
+        run_logger.info(
+            "run_training: resuming %s from step %d/%d (attempt %d)",
+            rdir.name,
+            start_step,
+            total_iterations,
+            attempt,
+        )
 
     if wandb_kwargs is not None:
         wandb.init(
@@ -439,10 +458,22 @@ def run_training(
                 **wandb_kwargs,  # caller wins on any key it explicitly sets
             }
         )
+        # Redoing steps after resuming from an older checkpoint than the last
+        # step actually reached (checkpoints only save every save_every steps,
+        # but every step gets logged) would otherwise violate wandb's own
+        # monotonically-increasing step counter and get silently dropped. Log
+        # `step` as a plain metric instead and use it as the x-axis, so wandb's
+        # internal counter (which only ever advances) is decoupled from ours
+        # (which can legitimately repeat across attempts).
+        # FOR NOW lets identify. If we recompute an older point, wandb will ignore it.
+        # #TODO: ADD A CLEAN CHECK FOR THIS.
+        # wandb.define_metric("step")
+        # wandb.define_metric("*", step_metric="step")
 
     train_data = np.memmap(volume / train_cfg["train_path"], dtype=np.uint16, mode="r")
     valid_data = np.memmap(volume / train_cfg["valid_path"], dtype=np.uint16, mode="r")
     loss_function = torch.nn.CrossEntropyLoss()
+    # #TODO: this is also language/transformer specific - compactify eventually.
     context_length = config["model_params"]["context_length"]
 
     if start_step < total_iterations:
@@ -451,69 +482,101 @@ def run_training(
             desc=str(rdir),
             colour="white",
         )
-        for step in pbar:
-            model.train()
-            inputs, targets = get_batch(
-                train_data,
-                train_cfg["batch_size"],
-                context_length,
-                seed=seed,
-                step=step,
-                device=device,
-            )
-            # lr_schedule_fn returns a single scalar lr, applied uniformly to
-            # every param group (there's only ever one lr in this implementation)
-            lr = lr_schedule_fn(step, **lr_schedule_params)
-            for group in optimizer.param_groups:
-                group["lr"] = lr
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = loss_function(outputs.transpose(1, 2), targets)
-            loss.backward()
-            optimizer.step()
-            if device == "mps":
-                # optimizer.step()'s in-place param updates are queued
-                # asynchronously on MPS; without this, the eval forward below
-                # can read partially-written weights and produce degenerate
-                # (near-uniform) output.
-                torch.mps.synchronize()
-            pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}")
-
-            val_loss = None
-            if step % train_cfg["val_every"] == 0:
-                model.eval()
-                with torch.no_grad():
-                    vi, vt = get_batch(
-                        valid_data,
-                        train_cfg["batch_size"],
-                        context_length,
-                        seed=seed,
-                        step=step,
-                        device=device,
-                    )
-                    val_loss = loss_function(model(vi).transpose(1, 2), vt).item()
-
-            # Z-suffixed UTC timestamp: parses directly with JS `new Date(...)` and
-            # converts unambiguously to any viewer's local timezone in a UI.
-            row = {
-                "step": step,
-                "attempt": attempt,
-                "loss": loss.item(),
-                "val_loss": val_loss,
-                "lr": lr,
-                "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            }
-            with open(rdir / "train.jsonl", "a") as f:
-                f.write(json.dumps(row) + "\n")
-
-            if wandb_kwargs is not None:
-                wandb.log(row, step=step)
-
-            if step % train_cfg["save_every"] == 0:
-                save_checkpoint(
-                    model, optimizer, step, attempt, seed, rdir, keep_optimizer_history=keep_optimizer_history
+        try:
+            for step in pbar:
+                model.train()
+                inputs, targets = get_batch(
+                    train_data,
+                    train_cfg["batch_size"],
+                    context_length,
+                    seed=seed,
+                    step=step,
+                    device=device,
                 )
+                # lr_schedule_fn returns a single scalar lr, applied uniformly to
+                # every param group (there's only ever one lr in this implementation)
+                lr = lr_schedule_fn(step, **lr_schedule_params)
+                for group in optimizer.param_groups:
+                    group["lr"] = lr
+
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = loss_function(outputs.transpose(1, 2), targets)
+                loss.backward()
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if total_norm > 1.0:
+                    run_logger.info(
+                        "run_training: clipped large gradients at step %d (attempt %d) -- total norm %.4f > max 1.0",
+                        step,
+                        attempt,
+                        total_norm.item(),
+                    )
+
+                optimizer.step()
+                if device == "mps":
+                    # optimizer.step()'s in-place param updates are queued
+                    # asynchronously on MPS; without this, the eval forward below
+                    # can read partially-written weights and produce degenerate
+                    # (near-uniform) output.
+                    torch.mps.synchronize()
+                pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}")
+
+                val_loss = None
+                if step % train_cfg["val_every"] == 0:
+                    model.eval()
+                    with torch.no_grad():
+                        vi, vt = get_batch(
+                            valid_data,
+                            train_cfg["batch_size"],
+                            context_length,
+                            seed=seed,
+                            step=step,
+                            device=device,
+                        )
+                        val_loss = loss_function(model(vi).transpose(1, 2), vt).item()
+
+                # Z-suffixed UTC timestamp: parses directly with JS `new Date(...)` and
+                # converts unambiguously to any viewer's local timezone in a UI.
+                row = {
+                    "step": step,
+                    "attempt": attempt,
+                    "loss": loss.item(),
+                    "val_loss": val_loss,
+                    "lr": lr,
+                    "timestamp": datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
+                }
+                with open(rdir / "train.jsonl", "a") as f:
+                    f.write(json.dumps(row) + "\n")
+
+                if wandb_kwargs is not None:
+                    wandb.log(row, step=step)
+
+                if step % train_cfg["save_every"] == 0:
+                    save_checkpoint(
+                        model, optimizer, step, attempt, seed, rdir, keep_optimizer_history=keep_optimizer_history
+                    )
+                    run_logger.info(
+                        "run_training: checkpoint saved at step %d/%d (%.1f%%) for %s",
+                        step,
+                        total_iterations,
+                        100 * step / total_iterations,
+                        rdir.name,
+                    )
+        except BaseException as exc:
+            # Purely for visibility -- deliberately re-raised unchanged, not
+            # swallowed. `step` is whatever was in progress when this fired,
+            # not necessarily a completed/checkpointed one.
+            run_logger.warning(
+                "run_training: loop for %s exited before finishing, at step %d/%d (%.1f%%) -- %r",
+                rdir.name,
+                step,
+                total_iterations,
+                100 * step / total_iterations,
+                exc,
+            )
+            raise
 
         # always persist the true final step, even if total_iterations isn't a
         # clean multiple of save_every -- so a normal, uninterrupted finish
@@ -528,10 +591,14 @@ def run_training(
                 rdir,
                 keep_optimizer_history=keep_optimizer_history,
             )
+            run_logger.info(
+                "run_training: checkpoint saved at step %d/%d (100.0%%) for %s", total_iterations, total_iterations, rdir.name
+            )
 
     if wandb_kwargs is not None:
         wandb.finish()
 
+    run_logger.info("run_training: writing summary for %s", rdir.name)
     write_run_summary(rdir, config, total_iterations, volume)
     return model, optimizer, rdir
 
