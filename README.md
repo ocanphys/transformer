@@ -7,6 +7,15 @@
 - device parameter control - hardcode vs config?
 - 
 
+## ideas
+- can we visualize the inference process
+- tensorboard or wandb or custom UI
+- 
+
+## considerations
+- memory/gpu/volume resource and cost considerations. Estimate but also log.
+- benchmark before you go larger scale.
+- cuda stack - gpus/cpus test parallelism.
 
 ## to do
 

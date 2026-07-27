@@ -1,5 +1,6 @@
 import importlib
 import json
+import time
 import logging
 import os
 import torch
@@ -268,6 +269,34 @@ def save_checkpoint(model, optimizer, step, attempt, seed, run_directory, keep_o
         strip_optimizer_state(prev)
 
 
+def gpu_stats(device) -> dict | None:
+    """Snapshot of GPU telemetry: device name, utilization, power draw,
+    temperature, clock rate, peak memory allocated + device total + percent
+    used. None if device isn't CUDA.
+
+    Resets peak-memory tracking after reading it, so the next call's
+    max_memory_allocated_gb reflects only the interval since now, not since
+    process start -- call this on some fixed cadence (see gpu_check_every)
+    rather than freely, or that interval stops meaning anything consistent.
+    """
+    if not str(device).startswith("cuda"):
+        return None
+    total_memory_gb = torch.cuda.get_device_properties(device).total_memory / 1.0e9
+    max_allocated_gb = torch.cuda.max_memory_allocated(device) / 1.0e9
+    stats = {
+        "gpu_type": torch.cuda.get_device_name(device),
+        "utilization": torch.cuda.utilization(device),
+        "power_draw": torch.cuda.power_draw(device),
+        "temperature": torch.cuda.temperature(device),
+        "clock_rate": torch.cuda.clock_rate(device),
+        "max_memory_allocated_gb": max_allocated_gb,
+        "total_memory_gb": total_memory_gb,
+        "memory_percent_used": 100 * max_allocated_gb / total_memory_gb,
+    }
+    torch.cuda.reset_peak_memory_stats(device)
+    return stats
+
+
 def write_run_summary(run_directory: Path, config: dict, final_step: int, volume: Path) -> None:
     """Write summary.json capturing the run's final state. Reads the full
     train.jsonl history (which spans every resume of this run) rather than
@@ -285,6 +314,18 @@ def write_run_summary(run_directory: Path, config: dict, final_step: int, volume
 
     best_train_row = min(rows, key=lambda r: r["loss"], default=None)
     best_val_row = min(val_rows, key=lambda r: r["val_loss"], default=None)
+    # Peak across every gpu_check_every snapshot this run logged (each one only
+    # covers its own interval, since gpu_stats() resets peak-tracking every call).
+    max_memory_allocated_gb = max(
+        (r["max_memory_allocated_gb"] for r in rows if "max_memory_allocated_gb" in r), default=None
+    )
+
+    # gpu_type/total_memory_gb are static hardware facts -- one fresh snapshot
+    # here is enough, no need to aggregate them across rows like the peak above.
+    device = str(config.get("model_params", {}).get("device", ""))
+    final_gpu_stats = gpu_stats(device)
+    gpu_type = final_gpu_stats["gpu_type"] if final_gpu_stats else None
+    gpu_total_memory_gb = final_gpu_stats["total_memory_gb"] if final_gpu_stats else None
 
     summary = {
         "run_directory": str(run_directory.relative_to(volume)),
@@ -301,6 +342,14 @@ def write_run_summary(run_directory: Path, config: dict, final_step: int, volume
         "best_val_loss_step": best_val_row["step"] if best_val_row else None,
         "started_at": rows[0]["timestamp"] if rows else None,
         "ended_at": rows[-1]["timestamp"] if rows else None,
+        "wall_clock_time": str(
+            datetime.fromisoformat(rows[-1]["timestamp"]) - datetime.fromisoformat(rows[0]["timestamp"])
+        )
+        if rows
+        else None,
+        "max_memory_allocated_gb": max_memory_allocated_gb,
+        "gpu_type": gpu_type,
+        "gpu_total_memory_gb": gpu_total_memory_gb,
     }
     (run_directory / "summary.json").write_text(json.dumps(summary, indent=2))
 
@@ -377,7 +426,7 @@ def run_training(
             raise FileNotFoundError(f"train_path not found: {train_path}")
         if not valid_path.exists():
             raise FileNotFoundError(f"valid_path not found: {valid_path}")
-        
+
         ## < -This part is tokenizer specific.
         tokenizer_uid = train_path.parent.name  # data/{dataset_name}/bin/{tokenizer_uid}/{split}.bin
         tokenizer_config = json.loads((volume / "tokenizers" / tokenizer_uid / "config.json").read_text())
@@ -387,7 +436,7 @@ def run_training(
                 f"tokenizer {tokenizer_uid!r}'s vocab_size ({tokenizer_config['vocab_size']})"
             )
         ## ->
-        
+
         rdir = make_run_dir(config["description"], config["seed"], volume)  # always a fresh folder
         serializable = {
             **config,
@@ -411,6 +460,7 @@ def run_training(
     seed = config["seed"]
     lr_schedule_fn = config["lr_schedule_fn"]
     lr_schedule_params = config["lr_schedule_params"]
+    gpu_check_every = train_cfg.get("gpu_check_every")  # in steps; None disables GPU telemetry entirely
 
     # Named after rdir, so this call's logs are scoped to this run by
     # construction -- no shared handler to add/remove, no risk of a later
@@ -475,7 +525,6 @@ def run_training(
     loss_function = torch.nn.CrossEntropyLoss()
     # #TODO: this is also language/transformer specific - compactify eventually.
     context_length = config["model_params"]["context_length"]
-
     if start_step < total_iterations:
         pbar = tqdm(
             range(start_step + 1, total_iterations + 1),
@@ -483,8 +532,12 @@ def run_training(
             colour="white",
         )
         try:
+            if device == "cuda" and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
             for step in pbar:
+                # set self.training = True for all modules / submodule specific behaviour is controlled
                 model.train()
+                # pull a batch and return as tensors living on the device memory.
                 inputs, targets = get_batch(
                     train_data,
                     train_cfg["batch_size"],
@@ -494,8 +547,8 @@ def run_training(
                     device=device,
                 )
                 # lr_schedule_fn returns a single scalar lr, applied uniformly to
-                # every param group (there's only ever one lr in this implementation)
                 lr = lr_schedule_fn(step, **lr_schedule_params)
+                # every param group (there's only ever one lr in this implementation)
                 for group in optimizer.param_groups:
                     group["lr"] = lr
 
@@ -513,14 +566,7 @@ def run_training(
                     )
 
                 optimizer.step()
-                if device == "mps":
-                    # optimizer.step()'s in-place param updates are queued
-                    # asynchronously on MPS; without this, the eval forward below
-                    # can read partially-written weights and produce degenerate
-                    # (near-uniform) output.
-                    torch.mps.synchronize()
                 pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}")
-
                 val_loss = None
                 if step % train_cfg["val_every"] == 0:
                     model.eval()
@@ -543,10 +589,12 @@ def run_training(
                     "loss": loss.item(),
                     "val_loss": val_loss,
                     "lr": lr,
-                    "timestamp": datetime.now(timezone.utc)
-                    .isoformat(timespec="milliseconds")
-                    .replace("+00:00", "Z"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                 }
+                if gpu_check_every and step % gpu_check_every == 0:
+                    stats = gpu_stats(device)
+                    if stats is not None:
+                        row.update(stats)
                 with open(rdir / "train.jsonl", "a") as f:
                     f.write(json.dumps(row) + "\n")
 
@@ -592,14 +640,24 @@ def run_training(
                 keep_optimizer_history=keep_optimizer_history,
             )
             run_logger.info(
-                "run_training: checkpoint saved at step %d/%d (100.0%%) for %s", total_iterations, total_iterations, rdir.name
+                "run_training: checkpoint saved at step %d/%d (100.0%%) for %s",
+                total_iterations,
+                total_iterations,
+                rdir.name,
             )
-
-    if wandb_kwargs is not None:
-        wandb.finish()
 
     run_logger.info("run_training: writing summary for %s", rdir.name)
     write_run_summary(rdir, config, total_iterations, volume)
+
+    if wandb_kwargs is not None:
+        # base_path=str(rdir) makes the path relative to rdir -- just "summary.json",
+        # so it lands flat at the run's files root instead of wandb mirroring the
+        # full absolute directory structure into a nested folder.
+        wandb.save(
+            str(rdir / "summary.json"), base_path=str(rdir)
+        )  # must happen before finish() -- can't upload to a closed run
+        wandb.finish()
+
     return model, optimizer, rdir
 
 
