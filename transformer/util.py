@@ -624,6 +624,10 @@ def run_training(
                 100 * step / total_iterations,
                 exc,
             )
+            if wandb_kwargs is not None:
+                # exit_code!=0 marks the run "Failed" immediately, instead of
+                # leaving it to wandb's passive crashed-heartbeat detection.
+                wandb.finish(exit_code=1)
             raise
 
         # always persist the true final step, even if total_iterations isn't a
