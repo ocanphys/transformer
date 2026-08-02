@@ -40,6 +40,7 @@ Usage:
 
 import json
 import time
+from contextlib import contextmanager
 from datetime import datetime, UTC
 from pathlib import Path
 
@@ -105,6 +106,16 @@ async def status(call):
 # --------------------------------------------------------------------------------------
 
 MATCH, MISMATCH, UNKNOWN = "match", "mismatch", "unknown"
+
+
+class LeaseLost(Exception):
+    """This attempt can no longer prove it owns the run, so it must stop writing.
+
+    An exception rather than a return value because the check lives inside a
+    context manager the training loop enters: raising is what lets a denied gate
+    unwind a loop this module does not own, without the trainer having to know a
+    lease exists. `_attempt` is the only thing that catches it.
+    """
 
 
 def lease_key(run_id: str) -> str:
@@ -347,78 +358,94 @@ def _attempt(run_id: str) -> dict:
         volume.commit()
         return {"run_id": run_id, "reason": reason}
 
-    log(f"boot call_id={my_id}")
+    @contextmanager
+    def holding_lease(label: str, tries: int = GATE_RETRIES, backoff: float = GATE_BACKOFF, commit: bool = False):
+        """Run an arbitrary block only while this attempt provably owns the run,
+        and optionally make what it wrote durable.
 
-    # Fence-in. The retries here cover the spawn-before-put window (the launcher
-    # cannot write the lease until the spawn returns a call id) plus transport
-    # transients. An explicit mismatch is not retried: it is a fresh, positive
-    # "someone else owns this".
-    for i in range(1, FENCE_IN_RETRIES + 1):
-        verdict = fence(run_id, my_id)
-        if verdict == MATCH:
-            break
-        if verdict == MISMATCH:
-            return log_exit("fence-in mismatch -- another attempt holds this run")
-        if i == FENCE_IN_RETRIES:
-            return log_exit(f"fence-in indeterminate after {FENCE_IN_RETRIES} tries -- never confirmed ownership")
-        log(f"fence-in indeterminate, retry {i}/{FENCE_IN_RETRIES}")
-        time.sleep(FENCE_IN_BACKOFF)
+            with holding_lease("fence-in", FENCE_IN_RETRIES, FENCE_IN_BACKOFF):
+                ...                                  # just needs to be the owner
+            with holding_lease(f"step {step}", commit=True):
+                write_checkpoint(...)                # ... and wants it to survive
 
-    config = read_config(run_id)
-    if config is None:
-        return log_exit("config.json missing or unparseable")
+        Enter is the gate, and it is the whole protocol: a mismatch raises at once,
+        because that is a fresh, positive "someone else owns this" and retrying a
+        no is hoping the truth changes. Only silence -- absent key, or the read
+        itself failed -- is worth waiting on, and only for a bounded time. Patience
+        is safe against a legitimate takeover: the launcher gates takeovers on
+        Modal, and a worker that has merely lost the Dict is still `running` there,
+        so its lease cannot move while we wait.
 
-    total_steps = config["total_steps"]
-    save_every = config["save_every"]
+        Exit commits, when asked. That commit is the only irreversible act in the
+        worker -- everything the block wrote before it is container-local, private,
+        and discarded when the container dies. So a denied gate costs work, never
+        history, and `commit=False` is genuinely free.
 
-    # Resume from the checkpoint files, not the ledger: the checkpoint is the
-    # training state, the ledger is for display.
-    step = checkpoint_step(run_id)
-    log(f"fence-in MATCH; resuming at step {step}/{total_steps}")
-
-    # Ledger rows are held in memory, not appended to train.jsonl as they happen.
-    # That looks like a needless buffer and is not: volume.commit() has *container*
-    # granularity, not per-path, so the eviction commit that flushes this attempt's
-    # private log would carry any dirty shared file out with it -- a superseded
-    # worker publishing an interval it was explicitly denied. Keeping the rows off
-    # disk until the gate has said MATCH is what makes "no confirmed lease, no
-    # shared write" true of the mechanism rather than of the intent. Losing them on
-    # eviction is not a cost; discarding the unconfirmed interval is the point.
-    pending: list[dict] = []
-
-    while step < total_steps:
-        step += 1
-        do_work(config)  # <- the only line a real trainer replaces
-        pending.append({"step": step, "ts": utc(), "call_id": my_id})
-
-        if step % save_every and step != total_steps:
-            continue
-
-        # --- the commit gate: the one place the Dict protects the Volume ---
-        # No confirmed MATCH means no shared-namespace activity at all -- not the
-        # checkpoint, not the commit. Patience on UNKNOWN is safe against a
-        # legitimate takeover, because the launcher's own gate consults Modal,
-        # and a worker that has merely lost the Dict is still `running` there --
-        # so its lease cannot legitimately move while we wait.
-        for i in range(1, GATE_RETRIES + 1):
+        If the block raises, the commit is skipped and the exception propagates: a
+        half-written boundary is not a boundary.
+        """
+        for i in range(1, tries + 1):
             verdict = fence(run_id, my_id)
             if verdict == MATCH:
                 break
             if verdict == MISMATCH:
-                return log_exit(f"superseded at step {step} -- interval dropped, committed history untouched")
-            if i == GATE_RETRIES:
-                return log_exit(f"gate indeterminate after {GATE_RETRIES} tries at step {step}")
-            log(f"gate indeterminate at step {step}, retry {i}/{GATE_RETRIES}")
-            time.sleep(GATE_BACKOFF * i)  # linear backoff; no jitter needed at this fleet size
+                raise LeaseLost(f"{label}: another attempt holds this run")
+            if i == tries:
+                raise LeaseLost(f"{label}: indeterminate after {tries} tries -- ownership never confirmed")
+            log(f"{label}: indeterminate, retry {i}/{tries}")
+            time.sleep(backoff * i)  # linear; no jitter needed at this fleet size
 
-        # Checkpoint before ledger, so a committed row that names a checkpoint
-        # always resolves to a file that exists.
-        write_checkpoint(rdir, step, config)
-        with open(rdir / "train.jsonl", "a") as f:
-            f.writelines(json.dumps(row) + "\n" for row in pending)
-        pending.clear()
-        volume.commit()  # the commit unit: this checkpoint, its ledger rows, and this interval's logs, together
-        log(f"boundary committed at step {step}/{total_steps}")
+        yield
+
+        if commit:
+            volume.commit()
+            log(f"committed {label}")
+
+    log(f"boot call_id={my_id}")
+
+    # Ledger rows are held in memory, not appended to train.jsonl as they happen.
+    # That looks like a needless buffer and is not: volume.commit() has *container*
+    # granularity, not per-path, so the exit commit that flushes this attempt's
+    # private log would carry any dirty shared file out with it -- a superseded
+    # worker publishing an interval it was explicitly denied. Keeping the rows off
+    # disk until the gate has said MATCH is what makes "no confirmed lease, no
+    # shared write" true of the mechanism rather than of the intent. Losing them on
+    # the way out is not a cost; discarding the unconfirmed interval is the point.
+    pending: list[dict] = []
+
+    try:
+        # Fence-in. Its retries cover the launcher's spawn-before-put window plus
+        # transport transients; nothing here is written, so nothing needs committing.
+        with holding_lease("fence-in", FENCE_IN_RETRIES, FENCE_IN_BACKOFF):
+            config = read_config(run_id)
+            if config is None:
+                return log_exit("config.json missing or unparseable")
+
+            total_steps = config["total_steps"]
+            save_every = config["save_every"]
+
+            # Resume from the checkpoint files, not the ledger: the checkpoint is
+            # the training state, the ledger is for display.
+            step = checkpoint_step(run_id)
+            log(f"fence-in MATCH; resuming at step {step}/{total_steps}")
+
+        while step < total_steps:
+            step += 1
+            do_work(config)  # <- the only line a real trainer replaces
+            pending.append({"step": step, "ts": utc(), "call_id": my_id})
+
+            if step % save_every and step != total_steps:
+                continue
+
+            # Everything durable about this interval lands as one unit: the
+            # checkpoint first, so a committed row naming it always resolves.
+            with holding_lease(f"boundary at step {step}/{total_steps}", commit=True):
+                write_checkpoint(rdir, step, config)
+                with open(rdir / "train.jsonl", "a") as f:
+                    f.writelines(json.dumps(row) + "\n" for row in pending)
+                pending.clear()
+    except LeaseLost as e:
+        return log_exit(str(e))
 
     return log_exit(f"finished at step {step}/{total_steps}")
 
