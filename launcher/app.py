@@ -39,17 +39,19 @@ import logging
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime, UTC
-from pathlib import Path
 
 import modal
 from modal.exception import Error, FunctionTimeoutError, OutputExpiredError
 
+# The jobs, and the run-folder substrate both sides share, live in jobs.py. The
+# dependency runs one way (app -> jobs; jobs never imports app), so there is no
+# cycle, and Aborted has one definition -- the class app.py catches here is the
+# same one Count raises there.
+from jobs import Aborted, Count, mint_run_id, read_config, run_dir
+
 APP_NAME = "training-launcher"
 VOLUME_NAME = "test-volume"  # flip to "LLM-pretraining" once the real trainer is wired in
 DICT_NAME = "training-leases"
-
-RUNS = Path("/storage/runs")  # volume mount path, as seen inside the containers
 
 LEASE_RETRIES = 5  # how many times an indeterminate lease read is worth re-asking
 LEASE_BACKOFF = 5.0  # seconds x try number -> 5, 10, 15, 20: ~50s of patience in total
@@ -76,10 +78,17 @@ leases = modal.Dict.from_name(DICT_NAME, create_if_missing=True)
 
 # The toy worker needs nothing but the stdlib. A real trainer swaps this for the
 # uv_sync image from modal_lab/run.ipynb -- only this line changes.
-image = modal.Image.debian_slim(python_version="3.12")
+base_image = modal.Image.debian_slim(python_version="3.12")
+
+# jobs.py rides along on every image: app.py imports it at module load, so it must
+# be present in any container that imports app.py -- launch, work, and dashboard.
+# add_local_* has to come last in a chain (Modal adds these files at container
+# startup rather than baking them in, so editing jobs.py never rebuilds the image);
+# any build step like pip_install must therefore run before it.
+image = base_image.add_local_python_source("jobs")
 
 # The dashboard needs a web server, and its own module shipped alongside this one.
-web_image = image.pip_install("fastapi[standard]").add_local_python_source("dashboard")
+web_image = base_image.pip_install("fastapi[standard]").add_local_python_source("jobs", "dashboard")
 
 logger = logging.getLogger(__name__)
 
@@ -193,13 +202,6 @@ async def status(call):
 MATCH, MISMATCH, UNKNOWN = "match", "mismatch", "unknown"
 
 
-class Aborted(Exception):
-    """Stop this attempt, but it is not a crash -- leaving is the right answer.
-
-    `_attempt` catches this and logs a clean exit. Anything else that escapes is
-    a bug and gets reported as one. Jobs raise this when handed a folder they
-    cannot run.
-    """
 
 
 class LeaseLost(Aborted):
@@ -246,32 +248,9 @@ def fence(run_id: str, my_call_id: str) -> tuple[str, dict | None]:
 # --------------------------------------------------------------------------------------
 # the volume: what happened
 # --------------------------------------------------------------------------------------
-
-
-def run_dir(run_id: str) -> Path:
-    return RUNS / run_id
-
-
-def read_config(run_id: str) -> dict | None:
-    """The run's immutable definition, or None if it is missing/unparseable --
-    which is the launcher's cue to quarantine the folder rather than guess."""
-    try:
-        return json.loads((run_dir(run_id) / "config.json").read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def mint_run_id(name: str) -> str:
-    """`{YYYYMMDDTHHMMSS}_{name}` -- the folder name is the run's immutable
-    primary key.
-    """
-    now = datetime.now(UTC)
-    return f"{now:%Y%m%dT%H%M%S}_{name}"
-
-
-def utc() -> str:
-    """JS-friendly UTC timestamp, matching transformer.util's ledger rows."""
-    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+#
+# run_dir, read_config, and mint_run_id -- the folder layout every run shares --
+# live in jobs.py, the leaf both the launcher here and the jobs there import from.
 
 
 # --------------------------------------------------------------------------------------
@@ -646,148 +625,6 @@ def _attempt(run_id: str) -> dict:
         # launcher makes over the same committed files, so both read one truth.
         done, total = JOB.progress(job.rdir, job.config)
         return attempt.log_exit(f"finished at {done}/{total}")
-
-
-# --------------------------------------------------------------------------------------
-# the job -- the toy stand-in for training, and the shape any other job follows
-# --------------------------------------------------------------------------------------
-
-
-class Count:
-    """Counts to total_steps, saving a checkpoint every save_every.
-
-    A job is a class over one run folder, and it is only two things: code that
-    runs once the lease is held, and a way to report how far the folder got.
-
-    That split shows up in the method types. `run` is an instance method because
-    it needs the lease. It takes nothing and returns nothing, which is what makes
-    it safe to call twice: where to start comes from the folder, and what got done
-    comes from the folder afterwards. So a job can be any code at all, rather than
-    something obliged to count steps. `make_config` and `progress` are
-    classmethods because the launcher calls them too, with no attempt and no lease
-    in hand.
-
-    Shaped like training on purpose, so the seam is proven rather than assumed:
-    step-numbered checkpoints named the way transformer.util names them, an
-    append-only ledger, and progress read from committed files.
-    """
-
-    def __init__(self, lease, run_id: str):
-        # A lease and a folder is everything a job gets. No Attempt, so no route
-        # to identity, logging, or the Dict; the one useful fact, which call is
-        # writing, rides along on the lease.
-        #
-        # The job reads its own config, since it is the only thing that can say
-        # whether a given config.json is one it can run. Both failures below are
-        # Aborted rather than crashes: a folder this job cannot run is one to
-        # leave alone.
-        self.lease = lease
-        self.run_id = run_id
-        self.rdir = run_dir(run_id)
-        config = read_config(run_id)
-        if config is None:
-            raise Aborted("config.json missing or unparseable")
-        try:
-            self.total_steps = config["total_steps"]
-            self.save_every = config["save_every"]
-        except KeyError as e:
-            raise Aborted(f"config.json is missing {e}") from None
-        self.config = config
-
-        # Ledger rows wait in memory instead of going straight to train.jsonl.
-        # This looks like a pointless buffer and is the opposite: it is what makes
-        # the whole guarantee true.
-        #
-        # Two things publish files we did not choose to publish. Our own exit
-        # commit covers the container, not one path. And Modal commits every
-        # mounted volume automatically when a container exits -- see
-        # modal/_runtime/user_code_imports.py, a finally block outside all
-        # lifecycle handlers -- so anything dirty on local disk is published even
-        # if we never call commit at all, and even if we were superseded.
-        #
-        # So "no lease, no durable write" cannot be enforced by gating commits.
-        # It is enforced by not writing shared files to disk until the gate has
-        # already said yes. Rows held in memory die with the container, which is
-        # exactly what should happen to an interval we were denied.
-        #
-        # This is the thing to carry over when wiring a real trainer: run_training
-        # appends to train.jsonl every step, so those rows would survive on exit.
-        # Either buffer them the way this does, or truncate the file back to its
-        # last committed size before leaving.
-        self.pending: list[dict] = []
-
-    @classmethod
-    def make_config(cls, total_steps: int, save_every: int, step_seconds: float = 1.0, seed: int = 0) -> dict:
-        """Build the config this job needs, in one place.
-
-        Kept here so the keys `run` reads and the keys a launch writes cannot
-        drift apart -- which matters because config.json is written once and every
-        later resume runs under it.
-        """
-        return {"total_steps": total_steps, "save_every": save_every, "step_seconds": step_seconds, "seed": seed}
-
-    @classmethod
-    def progress(cls, rdir: Path, config: dict) -> tuple[int, int]:
-        """How far this folder got, read from the checkpoint files.
-
-        Checkpoints are the only thing a commit makes durable -- ledger rows
-        written between them live in a container that may never come back. The
-        naming matches transformer.util.checkpoint_path, so a real trainer's
-        checkpoints are already readable here.
-
-        Raises Aborted if the config is not one this job understands. Callers scan
-        whole directories of folders, some of which were written by other tools
-        entirely, and "not mine" has to be an answer rather than a crash.
-        """
-        if "total_steps" not in config:
-            raise Aborted("config.json is not for this job (no total_steps)")
-        files = sorted((rdir / "checkpoints").glob("step_*.obj"))
-        done = int(files[-1].stem.split("_")[1]) if files else 0
-        return done, config["total_steps"]
-
-    def run(self) -> None:
-        """Carry this folder to total_steps, committing every save_every.
-
-        Takes nothing and returns nothing, which is what makes it safe to call
-        again: the starting point comes from the folder, not from an argument, and
-        what got done comes from `progress` afterwards, not from a return value.
-        Same reasoning as the launcher -- no caller is trusted to say where the
-        work is up to.
-        """
-        step, _ = self.progress(self.rdir, self.config)
-        logger.info("counting from %d to %d", step, self.total_steps)
-
-        while step < self.total_steps:
-            step += 1
-            time.sleep(self.config.get("step_seconds", 1.0))  # a real trainer's forward/backward
-            self.pending.append({"step": step, "ts": utc(), "call_id": self.lease.call_id})
-
-            if step % self.save_every and step != self.total_steps:
-                continue
-
-            # Everything durable about this interval lands together, checkpoint
-            # first, so a committed row never names a file that isn't there.
-            with self.lease(f"boundary at step {step}/{self.total_steps}", commit=True):
-                self.write_checkpoint(self.rdir, step, self.config)
-                with open(self.rdir / "train.jsonl", "a") as f:
-                    f.writelines(json.dumps(row) + "\n" for row in self.pending)
-                self.pending.clear()
-
-    @staticmethod
-    def write_checkpoint(rdir: Path, step: int, config: dict) -> None:
-        """Write a checkpoint, via a temp file and a rename.
-
-        Rename is atomic on the local filesystem, so the final name only ever
-        exists complete and no reader can catch a half-written file. Dropping
-        torch.save in here is the whole change for real training -- and note that
-        transformer.util.save_checkpoint writes straight to the final path, which
-        would need this same treatment.
-        """
-        out = rdir / "checkpoints" / f"step_{step:010d}.obj"
-        out.parent.mkdir(parents=True, exist_ok=True)  # the job owns its own layout
-        tmp = out.with_suffix(".obj.tmp")
-        tmp.write_text(json.dumps({"step": step, "seed": config.get("seed")}))
-        tmp.rename(out)
 
 
 # What this deployment runs. One name, so the launcher and the worker cannot

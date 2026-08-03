@@ -17,7 +17,8 @@ import asyncio
 
 import modal
 
-from app import JOB, RUNS, APP_NAME, Aborted, lease_key, leases, read_config, run_dir, status, volume
+from app import JOB, APP_NAME, lease_key, leases, status, volume
+from jobs import RUNS, Aborted, read_config, run_dir
 
 REFRESH_MS = 3000  # how often the page asks for fresh rows
 
