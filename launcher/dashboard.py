@@ -36,10 +36,15 @@ STATUS_LABEL = {
 CANCELLABLE = {"in_progress", "starting"}
 RESUMABLE = {"failed", "orphaned"}
 
-# Three stacked lines, drawn in currentColor so it inherits hover states.
+# Drawn in currentColor so they inherit hover states. Deliberately different
+# shapes rather than different colours: three lines for a log, bars for a ledger.
 LOGS_ICON = (
     "<svg width='13' height='13' viewBox='0 0 16 16' fill='none' stroke='currentColor' "
     "stroke-width='1.7' stroke-linecap='round'><path d='M2.6 4h10.8M2.6 8h10.8M2.6 12h6.6'/></svg>"
+)
+LEDGER_ICON = (
+    "<svg width='13' height='13' viewBox='0 0 16 16' fill='none' stroke='currentColor' "
+    "stroke-width='1.7' stroke-linecap='round'><path d='M3 13V7M8 13V3M13 13V9'/></svg>"
 )
 
 
@@ -158,6 +163,25 @@ async def read_logs(run_id: str) -> list[tuple[str, str, str]]:
     return lines
 
 
+async def read_ledger(run_id: str) -> list[str]:
+    """Every committed line of train.jsonl, in the order it was written.
+
+    Left as raw text on purpose. The ledger is whatever the job chose to append,
+    and rendering it as text shows exactly that -- including a torn final line or
+    a repeated step, which any attempt to parse it would tidy away.
+
+    Only committed lines exist here. A worker's most recent interval lives in its
+    container until the boundary commit, so this always lags the true step count
+    by less than one checkpoint.
+    """
+    await volume.reload.aio()
+
+    ledger = run_dir(run_id) / "train.jsonl"
+    if not ledger.is_file():
+        return []
+    return [line for line in ledger.read_text(errors="replace").splitlines() if line.strip()]
+
+
 # --------------------------------------------------------------------------------------
 # markup
 # --------------------------------------------------------------------------------------
@@ -192,10 +216,13 @@ def rows_html(runs: list[dict]) -> str:
         else:
             action = ""
 
-        # A plain link. The browser already knows how to open a tab, and the logs
-        # page wants its own address so it can be reloaded, shared, and left open
-        # beside the dashboard.
+        # Plain links. The browser already knows how to open a tab, and each page
+        # wants its own address so it can be reloaded, shared, and left open beside
+        # the dashboard.
         logs = f"<a class='icon' href='logs/{name}' target='_blank' rel='noopener' title='Attempt logs'>{LOGS_ICON}</a>"
+        ledger = (
+            f"<a class='icon' href='ledger/{name}' target='_blank' rel='noopener' title='train.jsonl'>{LEDGER_ICON}</a>"
+        )
 
         out.append(f"""
       <tr>
@@ -203,7 +230,7 @@ def rows_html(runs: list[dict]) -> str:
         <td><span class='st st-{status_key}'>{label}</span></td>
         <td>{bar}<span class='mono small'>{progress}</span></td>
         <td class='mono small'>{r["attempt"] or "—"}</td>
-        <td class='actions'>{action}{logs}</td>
+        <td class='actions'>{action}{logs}{ledger}</td>
       </tr>""")
     return "".join(out)
 
@@ -320,6 +347,7 @@ LOG_CSS = """
   .line:hover { background:color-mix(in srgb, var(--fg) 5%, transparent); }
   .line.hi .msg { font-weight:600; }
   .ts { color:var(--muted); flex:0 0 auto; }
+  .num { color:var(--muted); flex:0 0 3rem; text-align:right; }
   .att { flex:0 0 auto; font-weight:600; font-size:.72rem; letter-spacing:.02em; }
   .msg { white-space:pre-wrap; word-break:break-word; }
   .empty { color:var(--muted); padding:2rem 0; }
@@ -359,9 +387,44 @@ def logs_page_html(run_id: str, lines: list[tuple[str, str, str]]) -> str:
   <header>
     <h1 class='mono'>{html.escape(run_id)}</h1>
     <span class='muted small'>{len(lines)} lines · {len(attempts)} attempt(s)</span>
-    <span class='muted small'>· <a href='./'>all runs</a></span>
+    <span class='muted small'>· <a href='../ledger/{html.escape(run_id)}'>ledger</a>
+                              · <a href='../'>all runs</a></span>
   </header>
   <div class='legend'>{legend}</div>
+  <div class='log'>{body}</div>
+</main></body></html>"""
+
+
+def ledger_page_html(run_id: str, lines: list[str]) -> str:
+    """One run's train.jsonl, one row per line, as written.
+
+    Numbered by file position rather than by step: the two usually agree, but a
+    resumed run can legitimately repeat a step, and the line number is the thing
+    that stays true when it does.
+    """
+    import html
+
+    if lines:
+        body = "".join(
+            f"<div class='line'><span class='num'>{i}</span><span class='msg'>{html.escape(line)}</span></div>"
+            for i, line in enumerate(lines, 1)
+        )
+    else:
+        body = "<div class='empty'>Nothing committed yet.</div>"
+
+    return f"""<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>{html.escape(run_id)} · ledger</title>
+<style>{THEME_CSS}{LOG_CSS}
+  main {{ max-width: 76rem; }}
+</style></head>
+<body><main>
+  <header>
+    <h1 class='mono'>{html.escape(run_id)}</h1>
+    <span class='muted small'>{len(lines)} rows · train.jsonl</span>
+    <span class='muted small'>· <a href='../logs/{html.escape(run_id)}'>logs</a>
+                              · <a href='../'>all runs</a></span>
+  </header>
   <div class='log'>{body}</div>
 </main></body></html>"""
 
@@ -396,6 +459,11 @@ def build_web_app():
         """Every attempt's log for one run, merged in time order. Its own page,
         opened in its own tab."""
         return HTMLResponse(logs_page_html(run_id, await read_logs(run_id)), headers=no_store)
+
+    @web.get("/ledger/{run_id}", response_class=HTMLResponse)
+    async def ledger(run_id: str):
+        """One run's train.jsonl, as written."""
+        return HTMLResponse(ledger_page_html(run_id, await read_ledger(run_id)), headers=no_store)
 
     @web.post("/cancel/{run_id}")
     async def cancel(run_id: str):
