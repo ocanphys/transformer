@@ -35,6 +35,8 @@ Usage:
 """
 
 import json
+import logging
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, UTC
@@ -52,6 +54,22 @@ RUNS = Path("/storage/runs")  # volume mount path, as seen inside the containers
 LEASE_RETRIES = 5  # how many times an indeterminate lease read is worth re-asking
 LEASE_BACKOFF = 5.0  # seconds x try number -> 5, 10, 15, 20: ~50s of patience in total
 
+# What lands in an attempt's log. Root sits at LOG_LEVEL so anything anyone logs
+# is captured by default; LOG_LEVELS pins the chatty libraries down so their
+# noise cannot bury the run's own story. Add a name here when something new gets
+# loud, or set one to DEBUG when you need to see inside it.
+LOG_LEVEL = logging.INFO
+LOG_LEVELS = {
+    "modal": logging.WARNING,
+    "modal-client": logging.WARNING,
+    "grpclib": logging.WARNING,
+    "httpx": logging.WARNING,
+    "httpcore": logging.WARNING,
+    "urllib3": logging.WARNING,
+    "asyncio": logging.WARNING,
+    "filelock": logging.WARNING,
+}
+
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 leases = modal.Dict.from_name(DICT_NAME, create_if_missing=True)
@@ -59,6 +77,81 @@ leases = modal.Dict.from_name(DICT_NAME, create_if_missing=True)
 # The toy worker needs nothing but the stdlib. A real trainer swaps this for the
 # uv_sync image from modal_lab/run.ipynb -- only this line changes.
 image = modal.Image.debian_slim(python_version="3.12")
+
+# The dashboard needs a web server, and its own module shipped alongside this one.
+web_image = image.pip_install("fastapi[standard]").add_local_python_source("dashboard")
+
+logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------------------
+# logging: everything an attempt does, in the attempt's own file
+# --------------------------------------------------------------------------------------
+
+
+class AttemptFormatter(logging.Formatter):
+    """`<iso-timestamp> <message>`, in UTC.
+
+    The first column is a contract, not a style choice: the dashboard merges every
+    attempt's log for a run by sorting on it, and that only works because the
+    timestamps are one fixed-width UTC format. `converter = time.gmtime` is what
+    keeps them UTC even on a machine that thinks otherwise.
+
+    Our own lines stay bare. Anything from another library gets its level and
+    logger name in front, so foreign noise is identifiable at a glance without
+    cluttering the run's own story.
+    """
+
+    converter = time.gmtime
+
+    def __init__(self):
+        super().__init__(fmt="%(asctime)s.%(msecs)03dZ %(prefix)s%(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+
+    def format(self, record):
+        record.prefix = "" if record.name == __name__ else f"{record.levelname} {record.name}: "
+        return super().format(record)
+
+
+def _remove_attempt_handlers(root: logging.Logger) -> None:
+    """Drop and close any handler an earlier attempt left behind. Identified by a
+    marker attribute rather than by identity, so this works even when the attempt
+    that installed them is long gone -- which is exactly the case that matters,
+    since a leftover handler points at a previous run's file."""
+    for handler in list(root.handlers):
+        if getattr(handler, "_attempt_handler", False):
+            root.removeHandler(handler)
+            handler.close()
+
+
+class StdoutToLog:
+    """Sends `print()` through the logger instead of straight to the console.
+
+    Line-buffered, because print writes its text and its newline separately and a
+    half-line is not a log record. Nothing is written to the real stream here --
+    the logger's own console handler does that, so each line still reaches Modal's
+    logs exactly once, and there is no way to loop back into ourselves.
+
+    Only stdout is taken. tqdm and friends write to stderr, and their carriage-
+    return redraws would turn a training log into tens of thousands of fragments.
+    """
+
+    def __init__(self, log):
+        self.log = log
+        self.buffer = ""
+
+    def write(self, text):
+        self.buffer += text
+        while "\n" in self.buffer:
+            line, _, self.buffer = self.buffer.partition("\n")
+            if line.strip():
+                self.log(line)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
 
 
 # --------------------------------------------------------------------------------------
@@ -122,8 +215,13 @@ def lease_key(run_id: str) -> str:
     return f"lease:{run_id}"
 
 
-def fence(run_id: str, my_call_id: str) -> str:
+def fence(run_id: str, my_call_id: str) -> tuple[str, dict | None]:
     """Do we own this run? One fresh Dict read, three answers -- never two.
+
+    Returns the grant alongside the verdict. The read already fetched it, and
+    callers want to say *who* holds the run, not just whether we do -- which
+    attempt number we are, or which call beat us -- and that should not cost a
+    second round-trip to find out.
 
     MATCH and MISMATCH are both real answers: a key holding someone else's id is
     the server telling us they were granted this run, so we stop at once (asking
@@ -139,10 +237,10 @@ def fence(run_id: str, my_call_id: str) -> str:
     try:
         grant = leases.get(lease_key(run_id))
     except Exception:
-        return UNKNOWN
+        return UNKNOWN, None
     if grant is None:
-        return UNKNOWN
-    return MATCH if grant["call_id"] == my_call_id else MISMATCH
+        return UNKNOWN, None
+    return (MATCH if grant["call_id"] == my_call_id else MISMATCH), grant
 
 
 # --------------------------------------------------------------------------------------
@@ -237,8 +335,12 @@ async def launch(run_id: str | None = None, name: str = "run", config: dict | No
 
     # L3 -- finished? The job decides, from committed files alone. A finished run
     # must read as finished forever, and Modal eventually forgets old call
-    # outcomes, so we ask neither Modal nor the Dict here.
-    done, total = JOB.progress(run_dir(run_id), config)
+    # outcomes, so we ask neither Modal nor the Dict here. A config this job does
+    # not understand is quarantined the same way an unreadable one is.
+    try:
+        done, total = JOB.progress(run_dir(run_id), config)
+    except Aborted as e:
+        return {"run_id": run_id, "reason": f"{e} -- orphaned", "call_id": None}
     if done >= total:
         return {"run_id": run_id, "reason": "already complete", "call_id": None}
 
@@ -311,29 +413,94 @@ class Attempt:
         self.rdir = run_dir(run_id)
         self.logdir = self.rdir / "logs" / self.call_id
         self.logdir.mkdir(parents=True, exist_ok=True)
+        self._capture_logging()
+
+    def _capture_logging(self) -> None:
+        """Point everything this container logs at this attempt's own file.
+
+        Handlers go on the *root* logger, so any code anywhere -- ours, a job's, a
+        library's -- is captured without being asked to cooperate. A job holds only
+        a lease and has no route back to us, so this is what lets it log at all:
+        `logging.getLogger(__name__)` from anywhere lands in the right file.
+
+        Two handlers, on purpose: the file is the durable record that ships with
+        the run folder, the console keeps `modal app logs` working. print() is
+        routed through the logger rather than the console handler's stream, so it
+        appears in both, once each, and cannot loop back into itself.
+
+        Old handlers of ours are torn off first. Containers are reused, and a
+        leftover handler still points at the *previous* run's file -- which would
+        quietly write this attempt's lines into another run's folder.
+
+        Must run after volume.reload(): reloading fails while a file on the volume
+        is open, and this opens one.
+        """
+        root = logging.getLogger()
+        _remove_attempt_handlers(root)
+
+        self._file_handler = logging.FileHandler(self.logdir / "attempt.log")
+        self._console_handler = logging.StreamHandler(sys.stdout)
+        for handler in (self._file_handler, self._console_handler):
+            handler.setFormatter(AttemptFormatter())
+            handler._attempt_handler = True  # so a later attempt can find and drop it
+            root.addHandler(handler)
+
+        root.setLevel(LOG_LEVEL)
+        for name, level in LOG_LEVELS.items():
+            logging.getLogger(name).setLevel(level)
+        logging.captureWarnings(True)  # warnings.warn -> the log, not the void
+
+        self._stdout = sys.stdout
+        sys.stdout = StdoutToLog(self.log)
+
+    def _release_logging(self) -> None:
+        """Undo it, in the reverse order. Restoring stdout first means a late
+        print during teardown still has somewhere real to go."""
+        sys.stdout = self._stdout
+        _remove_attempt_handlers(logging.getLogger())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        """The other way out: something threw, so log_exit never ran.
+
+        The traceback is written here, while the file handler is still attached --
+        otherwise the one event most worth having a record of is the one event
+        that never reaches the record. Worded as an EXIT so every attempt ends
+        with exactly one, however it ended.
+
+        Nothing is committed on this path. Modal commits mounted volumes when a
+        container stops, so the line lands anyway, and choosing to commit here
+        would publish whatever else the job left dirty mid-failure.
+        """
+        if exc_type is not None:
+            logger.error("EXIT crashed: %r", exc, exc_info=(exc_type, exc, tb))
+        self._release_logging()
+        return False  # never swallow: work() still needs to see it and re-raise
 
     def log(self, msg: str) -> None:
-        """Write to this attempt's own log. The folder is named by a call id that
-        is unique forever, so attempts can never overwrite each other's logs, and
-        even a superseded one can safely flush its last words."""
-        line = f"{utc()} {msg}"
-        with open(self.logdir / "attempt.log", "a") as f:
-            f.write(line + "\n")
-        print(line)
+        """Write one line to this attempt's log.
+
+        Sugar over the module logger, so protocol lines and everything else land
+        in the same file through the same path. The folder is named by a call id
+        that is unique forever, so attempts can never overwrite each other's logs,
+        and even a superseded one can safely flush its last words.
+        """
+        logger.info(msg)
 
     def log_exit(self, reason: str) -> dict:
-        """Say why we are leaving, and publish it. The caller does the actual
-        leaving, by returning what this hands back.
+        """Say why we are leaving, publish it, and hand the caller its return
+        value. The caller does the actual leaving.
 
-        The commit is the point. attempt.log only exists in this container until
-        then, so an attempt that quits before its first checkpoint would otherwise
-        vanish without explaining itself.
+        There are two ways out of an attempt and this is the tidy one, reached
+        when we decided to stop: finished, denied, or handed a folder we cannot
+        run. The other is __exit__, for when something threw.
 
-        This commit happens without holding the lease, which is safe only because
-        attempt.log is the one dirty file -- commits publish the whole container,
-        not one path. A job that writes shared files continuously, instead of
-        buffering to a checkpoint the way `Count` does, has to deal with that; see
-        the note on `pending`.
+        The commit is leaseless, which is safe only because attempt.log is the one
+        dirty file -- commits publish the whole container, not one path. A job
+        that writes shared files continuously, instead of buffering to a
+        checkpoint the way `Count` does, has to deal with that; see `pending`.
         """
         self.log(f"EXIT {reason}")
         volume.commit()
@@ -368,13 +535,19 @@ class Attempt:
             underway: the launcher checks Modal before taking a run, and a worker
             that has merely lost the Dict still looks alive there, so nobody can
             take our lease while we wait.
+
+            Every check is logged, including the ones that pass. A boundary that
+            committed and a boundary that was allowed to commit are different
+            facts, and after the event only the log can tell them apart -- an
+            ownership check that quietly succeeded leaves nothing else behind.
             """
             for i in range(1, tries + 1):
-                verdict = fence(self.run_id, self.call_id)
+                verdict, grant = fence(self.run_id, self.call_id)
                 if verdict == MATCH:
+                    self.log(f"{label}: lease held (attempt {grant['attempt']}, try {i}/{tries})")
                     return
                 if verdict == MISMATCH:
-                    raise LeaseLost(f"{label}: another attempt holds this run")
+                    raise LeaseLost(f"{label}: another attempt holds this run ({grant['call_id']})")
                 if i == tries:
                     raise LeaseLost(f"{label}: indeterminate after {tries} tries -- ownership never confirmed")
                 self.log(f"{label}: indeterminate, retry {i}/{tries}")
@@ -414,8 +587,8 @@ class Attempt:
             yield
 
             if commit:
+                self.log(f"committing {label}")
                 volume.commit()
-                self.log(f"committed {label}")
 
         lease.confirm = confirm
         lease.call_id = self.call_id
@@ -447,29 +620,32 @@ def _attempt(run_id: str) -> dict:
     enters a context manager when it wants something to survive, and a denied
     gate raises straight through its own loop.
     """
-    attempt = Attempt(run_id)
-    attempt.log(f"boot call_id={attempt.call_id}")
+    # A context manager because of what it installs, not what it holds: log capture
+    # is process-wide state, and a reused container must never carry one attempt's
+    # handlers into the next run.
+    with Attempt(run_id) as attempt:
+        attempt.log(f"boot call_id={attempt.call_id}")
 
-    # The one thing a job needs from us, under the name it will use it by.
-    lease = attempt.make_lease()
+        # The one thing a job needs from us, under the name it will use it by.
+        lease = attempt.make_lease()
 
-    try:
-        # Prove ownership before doing anything at all, including reading the
-        # job's own config. The retries here cover the launcher's gap between
-        # spawn and grant, plus ordinary network hiccups. Nothing is written, so
-        # there is nothing to commit.
-        lease.confirm("fence-in")
-        job = JOB(lease, run_id)
-        job.run()
-    except Aborted as e:
-        return attempt.log_exit(str(e))
+        try:
+            # Prove ownership before doing anything at all, including reading the
+            # job's own config. The retries here cover the launcher's gap between
+            # spawn and grant, plus ordinary network hiccups. Nothing is written, so
+            # there is nothing to commit.
+            lease.confirm("fence-in")
+            job = JOB(lease, run_id)
+            job.run()
+        except Aborted as e:
+            return attempt.log_exit(str(e))
 
-    # Ask the job's progress rather than trust a return value. A job is just code
-    # that runs once it holds the lease; requiring it to report a step count would
-    # force every future job to keep one. This is the same call the launcher makes
-    # over the same committed files, so both read one truth.
-    done, total = JOB.progress(job.rdir, job.config)
-    return attempt.log_exit(f"finished at {done}/{total}")
+        # Ask the job's progress rather than trust a return value. A job is just
+        # code that runs once it holds the lease; requiring it to report a step
+        # count would force every future job to keep one. This is the same call the
+        # launcher makes over the same committed files, so both read one truth.
+        done, total = JOB.progress(job.rdir, job.config)
+        return attempt.log_exit(f"finished at {done}/{total}")
 
 
 # --------------------------------------------------------------------------------------
@@ -558,7 +734,13 @@ class Count:
         written between them live in a container that may never come back. The
         naming matches transformer.util.checkpoint_path, so a real trainer's
         checkpoints are already readable here.
+
+        Raises Aborted if the config is not one this job understands. Callers scan
+        whole directories of folders, some of which were written by other tools
+        entirely, and "not mine" has to be an answer rather than a crash.
         """
+        if "total_steps" not in config:
+            raise Aborted("config.json is not for this job (no total_steps)")
         files = sorted((rdir / "checkpoints").glob("step_*.obj"))
         done = int(files[-1].stem.split("_")[1]) if files else 0
         return done, config["total_steps"]
@@ -573,6 +755,8 @@ class Count:
         work is up to.
         """
         step, _ = self.progress(self.rdir, self.config)
+        logger.info("counting from %d to %d", step, self.total_steps)
+
         while step < self.total_steps:
             step += 1
             time.sleep(self.config.get("step_seconds", 1.0))  # a real trainer's forward/backward
@@ -611,6 +795,33 @@ class Count:
 # worker builds a JOB to do the work. Swapping in a real trainer is this line
 # plus the image.
 JOB = Count
+
+
+# --------------------------------------------------------------------------------------
+# the dashboard
+# --------------------------------------------------------------------------------------
+
+
+# scaledown_window has to be longer than the page's poll interval, or the container
+# goes idle *between* polls and every single refresh pays a cold start -- which is
+# what "the dashboard feels slow" turns out to mean. 60s keeps it warm through a
+# session and for a minute after.
+#
+# The cost is deploy latency: a warm container keeps serving the ASGI app it was
+# built with, so a UI change can take up to a minute to appear. When iterating on
+# the page, drop this to 2 (Modal's floor) to see changes within ~6s.
+@app.function(image=web_image, volumes={"/storage": volume}, timeout=60, scaledown_window=60)
+@modal.asgi_app()
+def dashboard():
+    """Serve the run list. All the drawing lives in dashboard.py.
+
+    That module is imported here, inside the function, for two reasons: it imports
+    from this one, so a module-level import would be circular; and it is only ever
+    needed in the container, where fastapi is installed.
+    """
+    from dashboard import build_web_app
+
+    return build_web_app()
 
 
 # --------------------------------------------------------------------------------------
