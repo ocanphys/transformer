@@ -1,41 +1,37 @@
-"""Training-run orchestration on Modal: one launcher, one worker, one lease.
+"""Run long jobs on Modal so that crashes, cancels, and restarts are all safe.
 
-Implements training_run_spec_kv.md with the smallest number of moving parts --
-a single module, three substrates, and no state anywhere else:
+A job lives in one folder on a Volume. Restarting it picks up from the last
+checkpoint; asking twice does nothing the second time; and two workers can never
+write the same folder. That last guarantee is enforced, not assumed.
 
-    Dict   = who may write, now        (the lease; fresh reads, atomic per key)
-    Modal  = who is alive, now         (FunctionCall state; queried, never written)
-    Volume = what happened             (config, checkpoints, ledger, logs)
+Three systems, each used only for what it is actually good at:
 
-`launch` is the mutex: max_containers=1 with single-input concurrency, so every
-launch/resume request is executed alone, in order. It is the only writer of the
-Dict -- a worker can never promote, renew, or release itself, so there is no
-unlock path to get wrong. `train` is the worker: it reads the lease and compares
-it against its own call id (the "fence"), and the one place that check gates is
-the checkpoint boundary -- no confirmed MATCH, no shared write. That single gate
-is what makes "at most one writer per run folder" a mechanism rather than a
-convention.
+    Dict   = who may write, now    (the lease -- always fresh, atomic per key)
+    Modal  = who is alive, now     (call state -- we ask, never write)
+    Volume = what happened         (config, checkpoints, ledger, logs)
 
-Deliberately simpler than the spec, in ways that are noted at each site:
-  - the worker here is a toy counter (§"the work" below), so the protocol can be
-    exercised end-to-end in seconds with no GPU. Real training swaps out one
-    function; the fence/gate/commit structure around it does not change.
-  - no config_sha256, no checkpoint pruning, no advisory between-boundary checks,
-    and no "compute one interval ahead while blocked" optimization.
-  - grants are not mirrored to the Volume. The spec keeps a write-only receipt of
-    every grant for audit, since the Dict holds only the current one and expires
-    after 7 idle days; the cost is a commit per launch, and what it buys back is
-    only history. Each attempt still has its own log folder, and every ledger row
-    still carries the call id that produced it.
+Three parts, and only the last is specific to what you are running:
 
-Takeover clears the key *before* spawning rather than overwriting it after, which
-the spec does not spell out and which a live run proved is load-bearing -- see the
-comment at the L5/L6 branch.
+    launch    start or resume a run. Safe to call repeatedly.
+    work      one attempt: prove ownership, run the job, record why it stopped.
+    JOB       the class this deployment runs; the toy counter here stands in
+              for training.
+
+How the guarantee works. `launch` runs one-at-a-time (max_containers=1) and is
+the only thing that ever writes the Dict, so a worker can never promote or
+release itself. A worker compares the lease against its own call id, and that
+check gates exactly one thing: `lease(commit=True)`. Nothing a worker writes is
+visible to anyone until that commit, so an unconfirmed worker can compute all it
+likes and still change nothing.
+
+Known simplifications, each explained where it happens: no config hash, no
+checkpoint pruning, no audit copy of each grant, and one shared retry policy for
+every lease check.
 
 Usage:
-    modal deploy launcher/app.py                       # the mutex must be the deployed app
+    modal deploy launcher/app.py                       # deploy (do this first)
     modal run launcher/app.py --name alpha             # start a run
-    modal run launcher/app.py --run-id 2026...._alpha  # resume it (idempotent)
+    modal run launcher/app.py --run-id 2026...._alpha  # resume it
 """
 
 import json
@@ -53,10 +49,8 @@ DICT_NAME = "training-leases"
 
 RUNS = Path("/storage/runs")  # volume mount path, as seen inside the containers
 
-FENCE_IN_RETRIES = 3  # covers the microscopic spawn-before-put window plus transients
-FENCE_IN_BACKOFF = 2.0  # seconds between fence-in retries
-GATE_RETRIES = 5  # boundary patience on an indeterminate lease read
-GATE_BACKOFF = 5.0  # seconds; the gate sleeps GATE_BACKOFF * attempt (linear, no jitter needed at N=5)
+LEASE_RETRIES = 5  # how many times an indeterminate lease read is worth re-asking
+LEASE_BACKOFF = 5.0  # seconds x try number -> 5, 10, 15, 20: ~50s of patience in total
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -73,18 +67,16 @@ image = modal.Image.debian_slim(python_version="3.12")
 
 
 async def status(call):
-    """Map every outcome of `call.get(timeout=0)` to a state string.
+    """Is this call still running? Ask Modal, without blocking.
 
-    Verified against modal 1.5.2 (`_functions.py:poll_function` +
-    `_utils/function_utils.py:_process_result`). Ordering matters:
-    OutputExpiredError/FunctionTimeoutError subclass *modal's* TimeoutError,
-    which is NOT the builtin -- so `except TimeoutError` catches only "running",
-    and those two must be caught before the generic Error branch. Any modal
-    upgrade must re-check that assumption; it is the one version-fragile thing
-    in this file.
+    Checked against modal 1.5.2. The catch order matters: OutputExpiredError and
+    FunctionTimeoutError both subclass *modal's* TimeoutError, which is not the
+    builtin -- so `except TimeoutError` catches only "still running", and those
+    two must come before the general Error branch. Re-check this on any modal
+    upgrade; it is the one version-fragile thing in the file.
 
-    There is deliberately one implementation, async: a second sync copy would
-    drift, and drift here means misclassifying a live worker as dead.
+    Keep this as the only copy. A second implementation drifts, and drift here
+    means calling a live worker dead.
     """
     try:
         await call.get.aio(timeout=0)
@@ -108,13 +100,21 @@ async def status(call):
 MATCH, MISMATCH, UNKNOWN = "match", "mismatch", "unknown"
 
 
-class LeaseLost(Exception):
-    """This attempt can no longer prove it owns the run, so it must stop writing.
+class Aborted(Exception):
+    """Stop this attempt, but it is not a crash -- leaving is the right answer.
 
-    An exception rather than a return value because the check lives inside a
-    context manager the training loop enters: raising is what lets a denied gate
-    unwind a loop this module does not own, without the trainer having to know a
-    lease exists. `_attempt` is the only thing that catches it.
+    `_attempt` catches this and logs a clean exit. Anything else that escapes is
+    a bug and gets reported as one. Jobs raise this when handed a folder they
+    cannot run.
+    """
+
+
+class LeaseLost(Aborted):
+    """We can no longer prove we own this run, so we must stop writing.
+
+    Raised rather than returned because the check sits inside a context manager
+    the job's own loop enters. Raising unwinds that loop from the inside, so the
+    job never needs to know a lease exists.
     """
 
 
@@ -123,17 +123,18 @@ def lease_key(run_id: str) -> str:
 
 
 def fence(run_id: str, my_call_id: str) -> str:
-    """One fresh Dict read, three outcomes -- never two.
+    """Do we own this run? One fresh Dict read, three answers -- never two.
 
-    MATCH is a positive fact and so is MISMATCH: the key holding *another* id is
-    the server asserting someone else was deliberately granted this run, and the
-    only correct response is to stop immediately (retrying a "no" is hoping the
-    truth changes). UNKNOWN -- absent key, or the call raised -- is silence, not
-    denial: its causes are a Dict outage, a 7-day expiry, or a worker that was
-    never granted at all, none of which mean "someone else owns this". Routing
-    absence to MISMATCH would let one Dict blip fell the whole fleet; routing it
-    to MATCH would let a partitioned zombie write. Bounded patience is the only
-    policy whose errors are conservative in both directions.
+    MATCH and MISMATCH are both real answers: a key holding someone else's id is
+    the server telling us they were granted this run, so we stop at once (asking
+    again is just hoping the answer changes).
+
+    UNKNOWN -- no key, or the read failed -- is silence, not a no. It happens
+    during a Dict outage, after a 7-day expiry, or for a worker that was never
+    granted anything. Treating silence as "denied" would take down the whole
+    fleet on one blip; treating it as "granted" would let a disconnected zombie
+    write. So we wait a bounded time and then give up, which is the only policy
+    that errs safely in both directions.
     """
     try:
         grant = leases.get(lease_key(run_id))
@@ -162,23 +163,6 @@ def read_config(run_id: str) -> dict | None:
         return None
 
 
-def checkpoint_step(run_id: str) -> int:
-    """Step of the newest committed checkpoint; 0 if there is none.
-
-    Progress is read off the checkpoint *files*, not the ledger, because
-    checkpoints are the only thing the commit boundary makes durable -- the
-    ledger rows between boundaries live in a container that may never come back.
-    Naming follows transformer.util.checkpoint_path, so the real trainer's
-    checkpoints are already readable here unchanged.
-    """
-    files = sorted((run_dir(run_id) / "checkpoints").glob("step_*.obj"))
-    return int(files[-1].stem.split("_")[1]) if files else 0
-
-
-def is_complete(run_id: str, config: dict) -> bool:
-    return checkpoint_step(run_id) >= config["total_steps"]
-
-
 def mint_run_id(name: str) -> str:
     """`{YYYYMMDDTHHMMSS}_{name}` -- the folder name is the run's immutable
     primary key.
@@ -199,97 +183,92 @@ def utc() -> str:
 
 @app.function(image=image, volumes={"/storage": volume}, max_containers=1, scaledown_window=60, timeout=300)
 async def launch(run_id: str | None = None, name: str = "run", config: dict | None = None) -> dict:
-    """Start a new run, or resume an existing one. Blind retries are always safe.
+    """Start a new run, or resume one. Calling it repeatedly is always safe.
 
-    `max_containers=1` plus single-input concurrency means Modal runs every one
-    of these sequentially in one container: the read-decide-write sequences below
-    (read the lease, ask Modal if that call is alive, then grant) are not atomic
-    in any substrate, and this is the only true mutual-exclusion primitive
-    available -- the Volume can't provide one (check-then-act over stale
-    snapshots) and neither can the Dict (no compare-and-swap on value).
+    `max_containers=1` makes Modal run these one at a time, in one container, and
+    that is the only real lock available here. The steps below read the lease, ask
+    Modal whether that call is alive, then grant -- a sequence no single system
+    can do atomically. The Volume cannot lock (it checks against stale snapshots)
+    and neither can the Dict (no compare-and-swap).
 
-    That serialization only holds within one *app instance*, so every caller must
-    reach the deployed function via `Function.from_name` -- an ephemeral
-    `modal run` of this module gets its own container pool and its own mutex.
-    If that rule is broken, two protections remain: put-if-absent picks exactly
-    one winner among concurrent fresh grants, and the worker's fence bounds any
+    That only holds within one deployed app, so always reach this through
+    `Function.from_name`. A `modal run` of this module gets its own container pool
+    and its own lock. If that slips, two safety nets remain: put-if-absent picks
+    one winner among simultaneous new runs, and a worker's own fence limits any
     takeover race to one dropped checkpoint interval.
 
-    Returns {"run_id", "reason", ...} -- "reason" is always a plain string saying
-    what was decided, because a no-op and a spawn look identical from the caller
-    otherwise.
+    Always returns a "reason" string, because otherwise a no-op and a fresh spawn
+    look the same to the caller.
     """
-    await volume.reload.aio()  # this container is long-lived; its snapshot is stale by default
+    await volume.reload.aio()  # this container is long-lived, so its snapshot is stale by default
 
-    # L1 -- fresh run: create the folder and its immutable config, then spawn,
-    # then grant. Until the lease lands the worker sees no key at all, which is
-    # UNKNOWN, so it retries FENCE_IN_RETRIES times before giving up.
+    # L1 -- new run: create the folder and its config, spawn, then grant.
     #
-    # The config commit must precede the spawn so the worker's mount
-    # can see it; the call id does not exist before the spawn, so the grant
-    # cannot precede it either. That ordering is forced, not chosen.
+    # That order is forced, not chosen. The config has to be committed before the
+    # spawn or the worker's mount won't see it, and the call id doesn't exist
+    # until the spawn returns, so the grant can't come first either. In the gap
+    # the worker sees no key at all, which reads as UNKNOWN, so it waits.
     if run_id is None:
         run_id = mint_run_id(name)
         if run_dir(run_id).exists():
-            # if this folder has already been created - abort launch.
+            # Someone already owns this name. config.json is written once and
+            # every resume runs under it, so never write through an existing one.
             return {"run_id": run_id, "reason": "id already exists -- refusing to overwrite it", "call_id": None}
-        (run_dir(run_id) / "checkpoints").mkdir(parents=True, exist_ok=True)
+        run_dir(run_id).mkdir(parents=True)  # the job owns whatever lives inside
         (run_dir(run_id) / "config.json").write_text(json.dumps(config or {}, indent=2))
         await volume.commit.aio()
 
-        call = await train.spawn.aio(run_id)
+        call = await work.spawn.aio(run_id)
         granted = await leases.put.aio(
             lease_key(run_id), {"call_id": call.object_id, "granted_ts": time.time(), "attempt": 1}, skip_if_exists=True
         )
         if not granted:
-            # L2 -- someone else holds the lease, so abort this path. Unreachable
-            # in practice; the worker we just spawned self-evicts on its own fence.
+            # L2 -- someone grabbed this id first. Unreachable in practice; the
+            # worker we just spawned will see the mismatch and bow out by itself.
             return {"run_id": run_id, "reason": "lost a race for a freshly minted id", "call_id": None}
 
         return {"run_id": run_id, "reason": "spawned", "call_id": call.object_id}
 
-    # L7 -- no readable config: refuse. A run whose definition is gone is
-    # quarantined, never guessed at.
+    # L7 -- no readable config. A run whose definition is gone gets quarantined,
+    # never guessed at.
     config = read_config(run_id)
     if config is None:
         return {"run_id": run_id, "reason": "no readable config.json -- orphaned", "call_id": None}
 
-    # L3 -- complete: decided from the Volume alone. A finished run must read
-    # finished forever, and Modal garbage-collects call outcomes eventually, so
-    # neither the Dict nor Modal is consulted here.
-    if is_complete(run_id, config):
+    # L3 -- finished? The job decides, from committed files alone. A finished run
+    # must read as finished forever, and Modal eventually forgets old call
+    # outcomes, so we ask neither Modal nor the Dict here.
+    done, total = JOB.progress(run_dir(run_id), config)
+    if done >= total:
         return {"run_id": run_id, "reason": "already complete", "call_id": None}
 
-    # check if a lease exists - it might be a failed or paused run. tells you if
-    # anyone else ever worked on this folder, does not mean active. If there is a
-    # running legitimate owner, this is how we find it. Abort if someone else is
-    # already working on it
+    # L4 -- someone already working on it? The lease says who was last granted the
+    # run, which is not the same as who is running it: a lease pointing at a dead
+    # worker is the normal state of anything waiting to resume. So ask Modal about
+    # that specific call before believing it.
     grant = await leases.get.aio(lease_key(run_id))
     if grant is not None:
         state = await status(modal.FunctionCall.from_id(grant["call_id"]))
         if state == "running":
             return {"run_id": run_id, "reason": "already running", "call_id": grant["call_id"]}
 
-    # L5/L6 -- if we made this far this means this folder is available. Either start
-    # a new run or takeover from an expired/old lease. First clear (pop) the old
-    # lease if exists - then assign a lease to this function with updated attempt
-    # number.
+    # L5/L6 -- the folder is free. Take over from a dead lease, or adopt one that
+    # has none. Clear the old key, spawn, then grant.
     #
-    # The pop must come before the spawn, not after. Between spawn and put the key
-    # still names the dead attempt, and a warm container boots fast enough to read
-    # it -- an occupied key is an explicit MISMATCH, so the new worker would kill
-    # itself over a lease that is milliseconds from being its own. Clearing first
-    # makes that window an absent key, which is UNKNOWN, which fence-in rides out.
+    # Clearing before the spawn matters. Between spawn and grant the key still
+    # holds the dead attempt's id, and a warm container can boot fast enough to
+    # read it -- an occupied key means "someone else owns this", so the new worker
+    # would kill itself over a lease that is milliseconds from being its own.
+    # Clearing first makes that gap an empty key, which just means "wait".
 
     await leases.pop.aio(lease_key(run_id), None)
     attempt = (grant["attempt"] + 1) if grant else 1
-    call = await train.spawn.aio(run_id)
+    call = await work.spawn.aio(run_id)
     await leases.put.aio(lease_key(run_id), {"call_id": call.object_id, "granted_ts": time.time(), "attempt": attempt})
 
-    resumed_from = checkpoint_step(run_id)
     return {
         "run_id": run_id,
-        "reason": f"spawned attempt {attempt} from step {resumed_from}",
+        "reason": f"spawned attempt {attempt} from {done}/{total}",
         "call_id": call.object_id,
     }
 
@@ -299,17 +278,160 @@ async def launch(run_id: str | None = None, name: str = "run", config: dict | No
 # --------------------------------------------------------------------------------------
 
 
+class Attempt:
+    """One attempt at one run: who this container is and where it logs.
+
+    Jobs never get one of these. They get `make_lease()` -- permission, without
+    the identity behind it -- because the only thing a job needs from an attempt
+    is the right to make its writes durable.
+    """
+
+    def __init__(self, run_id: str):
+        # Refresh our view of the Volume, first thing and once only.
+        #
+        # Containers are reused, so a warm worker starts out holding a snapshot
+        # from before this run's folder existed. It would find no config and no
+        # progress -- and "no progress" means "start over", which is how a stale
+        # snapshot quietly throws away finished work. This has to come before our
+        # first local write, because reload can implicitly commit dirty files.
+        #
+        # Nothing later needs another one: once we own the run, we never read
+        # anyone else's data.
+        #
+        # This runs before fence-in, which looks backwards but isn't. Fencing only
+        # touches the Dict, so the two are unrelated; the order decides only how
+        # old our folder snapshot is when we read it -- one Dict round-trip's
+        # worth. It also cannot make that read authoritative: a superseded worker
+        # that passed its gate before the takeover may still commit afterwards,
+        # and that commit hasn't happened yet when we reload. See make_lease.
+        volume.reload()
+
+        self.run_id = run_id
+        self.call_id = modal.current_function_call_id()
+        self.rdir = run_dir(run_id)
+        self.logdir = self.rdir / "logs" / self.call_id
+        self.logdir.mkdir(parents=True, exist_ok=True)
+
+    def log(self, msg: str) -> None:
+        """Write to this attempt's own log. The folder is named by a call id that
+        is unique forever, so attempts can never overwrite each other's logs, and
+        even a superseded one can safely flush its last words."""
+        line = f"{utc()} {msg}"
+        with open(self.logdir / "attempt.log", "a") as f:
+            f.write(line + "\n")
+        print(line)
+
+    def log_exit(self, reason: str) -> dict:
+        """Say why we are leaving, and publish it. The caller does the actual
+        leaving, by returning what this hands back.
+
+        The commit is the point. attempt.log only exists in this container until
+        then, so an attempt that quits before its first checkpoint would otherwise
+        vanish without explaining itself.
+
+        This commit happens without holding the lease, which is safe only because
+        attempt.log is the one dirty file -- commits publish the whole container,
+        not one path. A job that writes shared files continuously, instead of
+        buffering to a checkpoint the way `Count` does, has to deal with that; see
+        the note on `pending`.
+        """
+        self.log(f"EXIT {reason}")
+        volume.commit()
+        return {"run_id": self.run_id, "reason": reason}
+
+    def make_lease(self, tries: int = LEASE_RETRIES, backoff: float = LEASE_BACKOFF):
+        """Hand out permission to write, as two ways of using one check:
+
+            lease.confirm("fence-in")     # just prove we own the run
+            with lease(commit=True):      # prove it, then make the block durable
+
+        `confirm` exists so proving ownership doesn't have to pretend to be a
+        block. A `with` whose exit does nothing is just a function call with extra
+        indentation, and it reads like a second gate when only one ever commits.
+
+        A closure, not a method, so it can travel alone: a job holds `lease` and
+        nothing else of ours. `lease.call_id` comes along because a job keeping a
+        ledger needs to stamp rows with who wrote them, and that is the only thing
+        about us it needs to know.
+
+        Retry settings are fixed here and captured, so callers ask for permission
+        rather than for a number of tries. One setting covers both uses; if
+        fence-in ever wants its own, call make_lease again with other arguments.
+        """
+
+        def confirm(label: str = "lease") -> None:
+            """Prove we still own the run, or raise LeaseLost.
+
+            Someone else's id raises immediately -- that is a real answer, and
+            asking again is just hoping it changes. Only silence is worth waiting
+            out, and only briefly. Waiting is safe even if a takeover is genuinely
+            underway: the launcher checks Modal before taking a run, and a worker
+            that has merely lost the Dict still looks alive there, so nobody can
+            take our lease while we wait.
+            """
+            for i in range(1, tries + 1):
+                verdict = fence(self.run_id, self.call_id)
+                if verdict == MATCH:
+                    return
+                if verdict == MISMATCH:
+                    raise LeaseLost(f"{label}: another attempt holds this run")
+                if i == tries:
+                    raise LeaseLost(f"{label}: indeterminate after {tries} tries -- ownership never confirmed")
+                self.log(f"{label}: indeterminate, retry {i}/{tries}")
+                time.sleep(backoff * i)  # linear; no jitter needed at this fleet size
+
+        @contextmanager
+        def lease(label: str = "lease", commit: bool = False):
+            """Prove we own the run, run the block, then commit if asked.
+
+                with lease(f"step {step}", commit=True):
+                    write_checkpoint(...)
+
+            The commit is the only irreversible thing a worker does. Everything
+            written before it exists only in this container and disappears with
+            it, so being denied costs work, never history. If the block raises,
+            the commit is skipped -- a half-written checkpoint is not a
+            checkpoint.
+
+            This does not mean "only one writer at any instant". The check and the
+            commit talk to two different services and cannot be made atomic, so
+            the lease can move while the block runs, and any worker can land a
+            commit it was authorized for a moment ago. The real guarantee is
+            weaker but enough: nobody commits without having proved ownership
+            since their last commit.
+
+            That gap is as wide as the block is slow, which ties it to checkpoint
+            size -- the toy writes a few bytes, but torch.save of a large model
+            plus the upload holds it open for seconds. Widening it corrupts
+            nothing: checkpoints are written once per step number, so a redone
+            interval overwrites itself from the same starting point, and the
+            ledger tolerates repeated steps. The cost is one interval done twice.
+            If that ever matters, shorten the block -- write the file outside the
+            gate and let the gated part do only the rename and commit.
+            """
+            confirm(label)
+
+            yield
+
+            if commit:
+                volume.commit()
+                self.log(f"committed {label}")
+
+        lease.confirm = confirm
+        lease.call_id = self.call_id
+        return lease
+
+
 @app.function(image=image, volumes={"/storage": volume}, timeout=3600, retries=0)
-def train(run_id: str) -> dict:
-    # if the worker raises a timeout error which comes up through call.get()
-    # this can't be distinguished from modal's own call.get(timeout=0) which
-    # is how we tell a function is running. This function catches every exception
-    # that appears in the worker and raises them as RuntimeErrors which clears
-    # the ambiguity and a raised timeout error is guaranteed to come from modal.
-    """One attempt at one run. Wrapped whole, because an escaping builtin
-    TimeoutError would be classified `running` by status() forever, pinning a
-    dead run at in_progress and blocking every future resume. Re-raising as
-    RuntimeError guarantees every escape classifies as `crashed`.
+def work(run_id: str) -> dict:
+    """One attempt at one run.
+
+    Everything is wrapped because of one ambiguity: Modal signals "still running"
+    by raising a builtin TimeoutError, and it also re-raises whatever the worker
+    raised. So a worker that dies on a socket or dataloader timeout -- both are
+    builtin TimeoutError since Python 3.10 -- would read as healthy forever, and
+    the launcher would refuse to resume it. Re-raising as RuntimeError guarantees
+    every failure reads as a failure.
     """
     try:
         return _attempt(run_id)
@@ -318,161 +440,177 @@ def train(run_id: str) -> dict:
 
 
 def _attempt(run_id: str) -> dict:
-    # The one reload, and it must be the very first thing: a container is reused
-    # across calls, so a warm worker inherits a volume snapshot taken before this
-    # run's folder even existed -- it would read no config and no checkpoints, and
-    # "no checkpoints" means "restart from step 0", which is how a stale snapshot
-    # turns into silently discarded training. It has to precede the first local
-    # write (the log folder below), since reload resolves the whole mount.
-    # Nothing after this needs it: the worker never reads another process's data
-    # once it owns the run, so the entire class of reload-ordering bugs stops here.
-    volume.reload()
+    """Prove ownership, hand the lease to the job, record why we stopped.
 
-    my_id = modal.current_function_call_id()
-    rdir = run_dir(run_id)
-    logdir = rdir / "logs" / my_id
-    logdir.mkdir(parents=True, exist_ok=True)
+    Nothing here knows what the job does -- not its config, not its layout, not
+    what "done" means to it. And the job never learns a lease exists: it just
+    enters a context manager when it wants something to survive, and a denied
+    gate raises straight through its own loop.
+    """
+    attempt = Attempt(run_id)
+    attempt.log(f"boot call_id={attempt.call_id}")
 
-    def log(msg: str) -> None:
-        """Append-only, and private to this attempt: the folder is named by a
-        globally unique call id, so no two attempts can collide here and even an
-        evicted attempt can safely flush its final log without holding the lease.
-        """
-        line = f"{utc()} {msg}"
-        with open(logdir / "attempt.log", "a") as f:
-            f.write(line + "\n")
-        print(line)
-
-    def log_exit(reason: str) -> dict:
-        """Record why this attempt is leaving and publish that record. The caller
-        does the actual leaving, by returning what this hands back.
-
-        The commit is the point: attempt.log is container-local until then, so an
-        attempt that aborts before its first checkpoint would otherwise vanish
-        without saying why. It is also leaseless, which is only safe because the
-        sole dirty file in the container is attempt.log, in a folder no other
-        attempt can write -- commit granularity is the container, not the path,
-        which is the rule the `pending` note in the loop exists to respect.
-        """
-        log(f"EXIT {reason}")
-        volume.commit()
-        return {"run_id": run_id, "reason": reason}
-
-    @contextmanager
-    def holding_lease(label: str, tries: int = GATE_RETRIES, backoff: float = GATE_BACKOFF, commit: bool = False):
-        """Run an arbitrary block only while this attempt provably owns the run,
-        and optionally make what it wrote durable.
-
-            with holding_lease("fence-in", FENCE_IN_RETRIES, FENCE_IN_BACKOFF):
-                ...                                  # just needs to be the owner
-            with holding_lease(f"step {step}", commit=True):
-                write_checkpoint(...)                # ... and wants it to survive
-
-        Enter is the gate, and it is the whole protocol: a mismatch raises at once,
-        because that is a fresh, positive "someone else owns this" and retrying a
-        no is hoping the truth changes. Only silence -- absent key, or the read
-        itself failed -- is worth waiting on, and only for a bounded time. Patience
-        is safe against a legitimate takeover: the launcher gates takeovers on
-        Modal, and a worker that has merely lost the Dict is still `running` there,
-        so its lease cannot move while we wait.
-
-        Exit commits, when asked. That commit is the only irreversible act in the
-        worker -- everything the block wrote before it is container-local, private,
-        and discarded when the container dies. So a denied gate costs work, never
-        history, and `commit=False` is genuinely free.
-
-        If the block raises, the commit is skipped and the exception propagates: a
-        half-written boundary is not a boundary.
-        """
-        for i in range(1, tries + 1):
-            verdict = fence(run_id, my_id)
-            if verdict == MATCH:
-                break
-            if verdict == MISMATCH:
-                raise LeaseLost(f"{label}: another attempt holds this run")
-            if i == tries:
-                raise LeaseLost(f"{label}: indeterminate after {tries} tries -- ownership never confirmed")
-            log(f"{label}: indeterminate, retry {i}/{tries}")
-            time.sleep(backoff * i)  # linear; no jitter needed at this fleet size
-
-        yield
-
-        if commit:
-            volume.commit()
-            log(f"committed {label}")
-
-    log(f"boot call_id={my_id}")
-
-    # Ledger rows are held in memory, not appended to train.jsonl as they happen.
-    # That looks like a needless buffer and is not: volume.commit() has *container*
-    # granularity, not per-path, so the exit commit that flushes this attempt's
-    # private log would carry any dirty shared file out with it -- a superseded
-    # worker publishing an interval it was explicitly denied. Keeping the rows off
-    # disk until the gate has said MATCH is what makes "no confirmed lease, no
-    # shared write" true of the mechanism rather than of the intent. Losing them on
-    # the way out is not a cost; discarding the unconfirmed interval is the point.
-    pending: list[dict] = []
+    # The one thing a job needs from us, under the name it will use it by.
+    lease = attempt.make_lease()
 
     try:
-        # Fence-in. Its retries cover the launcher's spawn-before-put window plus
-        # transport transients; nothing here is written, so nothing needs committing.
-        with holding_lease("fence-in", FENCE_IN_RETRIES, FENCE_IN_BACKOFF):
-            config = read_config(run_id)
-            if config is None:
-                return log_exit("config.json missing or unparseable")
+        # Prove ownership before doing anything at all, including reading the
+        # job's own config. The retries here cover the launcher's gap between
+        # spawn and grant, plus ordinary network hiccups. Nothing is written, so
+        # there is nothing to commit.
+        lease.confirm("fence-in")
+        job = JOB(lease, run_id)
+        job.run()
+    except Aborted as e:
+        return attempt.log_exit(str(e))
 
-            total_steps = config["total_steps"]
-            save_every = config["save_every"]
+    # Ask the job's progress rather than trust a return value. A job is just code
+    # that runs once it holds the lease; requiring it to report a step count would
+    # force every future job to keep one. This is the same call the launcher makes
+    # over the same committed files, so both read one truth.
+    done, total = JOB.progress(job.rdir, job.config)
+    return attempt.log_exit(f"finished at {done}/{total}")
 
-            # Resume from the checkpoint files, not the ledger: the checkpoint is
-            # the training state, the ledger is for display.
-            step = checkpoint_step(run_id)
-            log(f"fence-in MATCH; resuming at step {step}/{total_steps}")
 
-        while step < total_steps:
+# --------------------------------------------------------------------------------------
+# the job -- the toy stand-in for training, and the shape any other job follows
+# --------------------------------------------------------------------------------------
+
+
+class Count:
+    """Counts to total_steps, saving a checkpoint every save_every.
+
+    A job is a class over one run folder, and it is only two things: code that
+    runs once the lease is held, and a way to report how far the folder got.
+
+    That split shows up in the method types. `run` is an instance method because
+    it needs the lease. It takes nothing and returns nothing, which is what makes
+    it safe to call twice: where to start comes from the folder, and what got done
+    comes from the folder afterwards. So a job can be any code at all, rather than
+    something obliged to count steps. `make_config` and `progress` are
+    classmethods because the launcher calls them too, with no attempt and no lease
+    in hand.
+
+    Shaped like training on purpose, so the seam is proven rather than assumed:
+    step-numbered checkpoints named the way transformer.util names them, an
+    append-only ledger, and progress read from committed files.
+    """
+
+    def __init__(self, lease, run_id: str):
+        # A lease and a folder is everything a job gets. No Attempt, so no route
+        # to identity, logging, or the Dict; the one useful fact, which call is
+        # writing, rides along on the lease.
+        #
+        # The job reads its own config, since it is the only thing that can say
+        # whether a given config.json is one it can run. Both failures below are
+        # Aborted rather than crashes: a folder this job cannot run is one to
+        # leave alone.
+        self.lease = lease
+        self.run_id = run_id
+        self.rdir = run_dir(run_id)
+        config = read_config(run_id)
+        if config is None:
+            raise Aborted("config.json missing or unparseable")
+        try:
+            self.total_steps = config["total_steps"]
+            self.save_every = config["save_every"]
+        except KeyError as e:
+            raise Aborted(f"config.json is missing {e}") from None
+        self.config = config
+
+        # Ledger rows wait in memory instead of going straight to train.jsonl.
+        # This looks like a pointless buffer and is the opposite: it is what makes
+        # the whole guarantee true.
+        #
+        # Two things publish files we did not choose to publish. Our own exit
+        # commit covers the container, not one path. And Modal commits every
+        # mounted volume automatically when a container exits -- see
+        # modal/_runtime/user_code_imports.py, a finally block outside all
+        # lifecycle handlers -- so anything dirty on local disk is published even
+        # if we never call commit at all, and even if we were superseded.
+        #
+        # So "no lease, no durable write" cannot be enforced by gating commits.
+        # It is enforced by not writing shared files to disk until the gate has
+        # already said yes. Rows held in memory die with the container, which is
+        # exactly what should happen to an interval we were denied.
+        #
+        # This is the thing to carry over when wiring a real trainer: run_training
+        # appends to train.jsonl every step, so those rows would survive on exit.
+        # Either buffer them the way this does, or truncate the file back to its
+        # last committed size before leaving.
+        self.pending: list[dict] = []
+
+    @classmethod
+    def make_config(cls, total_steps: int, save_every: int, step_seconds: float = 1.0, seed: int = 0) -> dict:
+        """Build the config this job needs, in one place.
+
+        Kept here so the keys `run` reads and the keys a launch writes cannot
+        drift apart -- which matters because config.json is written once and every
+        later resume runs under it.
+        """
+        return {"total_steps": total_steps, "save_every": save_every, "step_seconds": step_seconds, "seed": seed}
+
+    @classmethod
+    def progress(cls, rdir: Path, config: dict) -> tuple[int, int]:
+        """How far this folder got, read from the checkpoint files.
+
+        Checkpoints are the only thing a commit makes durable -- ledger rows
+        written between them live in a container that may never come back. The
+        naming matches transformer.util.checkpoint_path, so a real trainer's
+        checkpoints are already readable here.
+        """
+        files = sorted((rdir / "checkpoints").glob("step_*.obj"))
+        done = int(files[-1].stem.split("_")[1]) if files else 0
+        return done, config["total_steps"]
+
+    def run(self) -> None:
+        """Carry this folder to total_steps, committing every save_every.
+
+        Takes nothing and returns nothing, which is what makes it safe to call
+        again: the starting point comes from the folder, not from an argument, and
+        what got done comes from `progress` afterwards, not from a return value.
+        Same reasoning as the launcher -- no caller is trusted to say where the
+        work is up to.
+        """
+        step, _ = self.progress(self.rdir, self.config)
+        while step < self.total_steps:
             step += 1
-            do_work(config)  # <- the only line a real trainer replaces
-            pending.append({"step": step, "ts": utc(), "call_id": my_id})
+            time.sleep(self.config.get("step_seconds", 1.0))  # a real trainer's forward/backward
+            self.pending.append({"step": step, "ts": utc(), "call_id": self.lease.call_id})
 
-            if step % save_every and step != total_steps:
+            if step % self.save_every and step != self.total_steps:
                 continue
 
-            # Everything durable about this interval lands as one unit: the
-            # checkpoint first, so a committed row naming it always resolves.
-            with holding_lease(f"boundary at step {step}/{total_steps}", commit=True):
-                write_checkpoint(rdir, step, config)
-                with open(rdir / "train.jsonl", "a") as f:
-                    f.writelines(json.dumps(row) + "\n" for row in pending)
-                pending.clear()
-    except LeaseLost as e:
-        return log_exit(str(e))
+            # Everything durable about this interval lands together, checkpoint
+            # first, so a committed row never names a file that isn't there.
+            with self.lease(f"boundary at step {step}/{self.total_steps}", commit=True):
+                self.write_checkpoint(self.rdir, step, self.config)
+                with open(self.rdir / "train.jsonl", "a") as f:
+                    f.writelines(json.dumps(row) + "\n" for row in self.pending)
+                self.pending.clear()
 
-    return log_exit(f"finished at step {step}/{total_steps}")
+    @staticmethod
+    def write_checkpoint(rdir: Path, step: int, config: dict) -> None:
+        """Write a checkpoint, via a temp file and a rename.
+
+        Rename is atomic on the local filesystem, so the final name only ever
+        exists complete and no reader can catch a half-written file. Dropping
+        torch.save in here is the whole change for real training -- and note that
+        transformer.util.save_checkpoint writes straight to the final path, which
+        would need this same treatment.
+        """
+        out = rdir / "checkpoints" / f"step_{step:010d}.obj"
+        out.parent.mkdir(parents=True, exist_ok=True)  # the job owns its own layout
+        tmp = out.with_suffix(".obj.tmp")
+        tmp.write_text(json.dumps({"step": step, "seed": config.get("seed")}))
+        tmp.rename(out)
 
 
-# --------------------------------------------------------------------------------------
-# the work itself -- the toy stand-in for training
-# --------------------------------------------------------------------------------------
-
-
-def do_work(config: dict) -> None:
-    """One step. A real trainer does a forward/backward here."""
-    time.sleep(config.get("step_seconds", 1.0))
-
-
-def write_checkpoint(rdir: Path, step: int, config: dict) -> None:
-    """tmp + rename, so no reader can ever observe a torn checkpoint: rename is
-    atomic on the container filesystem, and the volume only ever uploads the
-    final name. Write-once and monotonic -- checkpoints are never rewritten.
-
-    Naming matches transformer.util.checkpoint_path (`step_{step:010d}.obj`), so
-    swapping torch.save in here is the whole change on the real-training path.
-    No pruning: the trainer owns its own checkpoint hygiene.
-    """
-    out = rdir / "checkpoints" / f"step_{step:010d}.obj"
-    tmp = out.with_suffix(".obj.tmp")
-    tmp.write_text(json.dumps({"step": step, "seed": config.get("seed")}))
-    tmp.rename(out)
+# What this deployment runs. One name, so the launcher and the worker cannot
+# disagree: the launcher calls JOB.progress to see if a folder is finished, the
+# worker builds a JOB to do the work. Swapping in a real trainer is this line
+# plus the image.
+JOB = Count
 
 
 # --------------------------------------------------------------------------------------
@@ -482,15 +620,17 @@ def write_checkpoint(rdir: Path, step: int, config: dict) -> None:
 
 @app.local_entrypoint()
 def main(run_id: str = "", name: str = "run", total_steps: int = 20, save_every: int = 5, step_seconds: float = 1.0):
-    """Drive the *deployed* launcher -- never a local spawn.
+    """Start or resume a run through the deployed launcher.
 
-    `Function.from_name` is what keeps the mutex intact: calling `launch.remote`
-    from this ephemeral app instance would run it in a second container pool that
-    does not serialize against the deployed one.
+    `Function.from_name` is what keeps the lock intact. Calling `launch.remote`
+    from this throwaway app instance would run it in a second container pool that
+    doesn't serialize against the deployed one.
     """
     launcher = modal.Function.from_name(APP_NAME, "launch")
     if run_id:
+        # A resume passes no config at all: config.json was written once, at
+        # creation, and every attempt since runs under it.
         print(launcher.remote(run_id=run_id))
     else:
-        config = {"total_steps": total_steps, "save_every": save_every, "step_seconds": step_seconds, "seed": 0}
+        config = JOB.make_config(total_steps=total_steps, save_every=save_every, step_seconds=step_seconds)
         print(launcher.remote(name=name, config=config))
