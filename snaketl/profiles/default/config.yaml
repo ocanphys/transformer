@@ -1,0 +1,12 @@
+# Workflow profile, auto-loaded by snakemake because it sits at
+# profiles/default/ next to the Snakefile. These are defaults only -- any flag
+# passed on the command line wins.
+
+# Snakemake's default job scheduler solves an ILP via pulp, which shells out to
+# a bundled CBC binary. That binary is x86_64-only and dies with "Bad CPU type
+# in executable" on an arm64 Mac. The greedy scheduler needs no solver and is
+# indistinguishable here anyway: these jobs declare no resources to optimize
+# over, so there is nothing for the ILP to be smarter about.
+scheduler: greedy
+
+cores: 4

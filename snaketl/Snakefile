@@ -35,6 +35,37 @@ from transformer.util import download_and_concat, textfile_to_tokens_as_binary
 configfile: str(Path(workflow.basedir) / "config.yaml")
 
 
+def validate(config):
+    """Reject a config the DAG would otherwise happily build the wrong thing from.
+
+    The overlap rules are §4 policy: an encoder that saw a validation source has
+    the holdout baked into its merge table, and the resulting loss is not a
+    measurement of anything. Cheap to check here, invisible once it is a .bin.
+
+    uids share one namespace because targets are named by uid -- two rules with
+    the same name is a snakemake error anyway, this just says why.
+    """
+    names = [*config["sources"], *config["encoders"], *config["splits"]]
+    assert len(names) == len(set(names)), "uid collision across namespaces"
+    for uid, e in config["encoders"].items():
+        for src in e["fit_sources"]:
+            assert src in config["sources"], f"{uid}: unknown fit source {src}"
+    for uid, s in config["splits"].items():
+        assert s["encoder"] in config["encoders"], f"{uid}: unknown encoder {s['encoder']}"
+        fit = set(config["encoders"][s["encoder"]]["fit_sources"])
+        # Name the offenders: with several sources a side, "there is an overlap"
+        # leaves you diffing lists by eye.
+        overlap = set(s["train"]) & set(s["valid"])
+        assert not overlap, f"{uid}: train/valid overlap: {sorted(overlap)}"
+        leaked = set(s["valid"]) & fit
+        assert not leaked, f"{uid}: valid sources in {s['encoder']} fit set: {sorted(leaked)}"
+        for src in s["train"] + s["valid"]:
+            assert src in config["sources"], f"{uid}: unknown source {src}"
+    print (config)
+
+validate(config)
+
+
 # workflow.basedir is snaketl/. download_and_concat resolves output_path against
 # `volume`, so this is what puts /data beside this Snakefile.
 VOLUME = Path(workflow.basedir)
@@ -49,16 +80,18 @@ EOS = "\n<|endoftext|>\n"
 
 
 def split_bins(split_uid: str) -> list[str]:
-    """The .bin files one split needs: its train and valid sources, encoded with
-    its encoder. Nothing distinguishes a train bin from a valid one on disk --
-    which side a source sits on is a fact about the split, not about the file."""
+    """
+    list of .bin files a split needs: its train and valid sources, encoded with
+    its encoder. Nothing distinguishes a train bin from a valid one on disk.
+    """
     split = config["splits"][split_uid]
     return [str(BINS / split["encoder"] / f"{uid}.bin") for uid in split["train"] + split["valid"]]
 
 
 # Default target -- the first rule runs when no target is named. Builds nothing
 # itself; asks for every source's content.txt, every encoder's artifacts, and
-# every split's bins.
+# every split's bins. We won't necessarily need to run all of these at once.
+# workflow will create the parts it needs for a specific run.
 rule all:
     input:
         [str(SOURCES / uid / "content.txt") for uid in config["sources"]],
@@ -110,31 +143,27 @@ rule fit_encoder:
         tokenizer=str(TOKENIZERS / "{encoder_uid}" / "tokenizer.joblib"),
         config=str(TOKENIZERS / "{encoder_uid}" / "config.json"),
     params:
-        kind=lambda wildcards: config["encoders"][wildcards.encoder_uid]["kind"],
-        vocab_size=lambda wildcards: config["encoders"][wildcards.encoder_uid]["vocab_size"],
-        special_tokens=lambda wildcards: config["encoders"][wildcards.encoder_uid]["special_tokens"],
-        fit_sources=lambda wildcards: config["encoders"][wildcards.encoder_uid]["fit_sources"],
+        # The whole config.yaml entry, as one param. Snakemake compares params
+        # between runs, so any edit to the encoder -- vocab, tokens, fit list --
+        # refits it. We sort the 
+        # Sorted, because that comparison is on the dict's text form:
+        spec=lambda wildcards: dict(sorted(config["encoders"][wildcards.encoder_uid].items())),
     run:
-        if params.kind != "bpe":
-            raise ValueError(f"encoder {wildcards.encoder_uid}: only kind: bpe is implemented, got {params.kind!r}")
+        if params.spec["kind"] != "bpe":
+            raise ValueError(
+                f"encoder {wildcards.encoder_uid}: only kind: bpe is implemented, got {params.spec['kind']!r}"
+            )
 
         # train_bpe takes the list straight: it pretokenizes each file and sums
         # the counts, so this fits on the sources as one corpus without
         # concatenating them into a temporary file first.
-        vocab, merges = train_bpe(list(input), params.vocab_size, params.special_tokens)
+        vocab, merges = train_bpe(list(input), params.spec["vocab_size"], params.spec["special_tokens"])
 
         joblib.dump((vocab, merges), output.tokenizer)
-        Path(output.config).write_text(
-            json.dumps(
-                {
-                    "kind": params.kind,
-                    "vocab_size": params.vocab_size,
-                    "special_tokens": params.special_tokens,
-                    "fit_sources": params.fit_sources,
-                },
-                indent=2,
-            )
-        )
+        # The spec verbatim: config.json is the record of what this was fit
+        # from, and re-listing its fields here would just be a second copy to
+        # keep in sync. Tokenizer.from_files reads special_tokens back out of it.
+        Path(output.config).write_text(json.dumps(params.spec, indent=2))
 
 
 # Encode one source with one encoder -- a flat uint16 token stream, memmap-ready.

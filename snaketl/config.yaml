@@ -13,15 +13,26 @@ sources:
                 tags: [source:gutenberg, lang:en, genre:drama, author:shakespeare]}
   odyssey:     {urls: [https://gutenberg.org/cache/epub/1727/pg1727.txt],
                 tags: [source:gutenberg, lang:en, genre:fiction, author:homer]}
+  mobydick:    {urls: [https://www.gutenberg.org/cache/epub/2701/pg2701.txt],
+                tags: [source:gutenberg, lang:en, genre:fiction, author:melville]}
 
+
+# One encoder per split, fit on that split's training sources only (§4). They
+# cannot share one: main trains on montecristo, which nein holds out, so any
+# encoder fit for main is disqualified for nein and vice versa.
 encoders:
-  base: {kind: bpe, vocab_size: 5000,
+  base: {kind: bpe, vocab_size: 1000,
          special_tokens: ["<|endoftext|>", "<|begin|>", "<|end|>"],
-         fit_sources: [montecristo, romeojuliet]}
+         fit_sources: [odyssey, montecristo]}
+  epic: {kind: bpe, vocab_size: 1000,
+         special_tokens: ["<|endoftext|>", "<|begin|>", "<|end|>"],
+         fit_sources: [odyssey]}
 
 # A split is a query over sources, not an artifact: it names which sources train
 # and which are held out, and both sides are encoded with the split's encoder.
 # Sources must exist under sources: above.
 splits:
-  main: {encoder: base, train: [montecristo], valid: [romeojuliet]}
-  nein: {encoder: base, train: [odyssey],     valid: [montecristo, romeojuliet]}
+  main: {encoder: base, train: [odyssey], valid: [mobydick]}
+  split: {encoder: base, train: [montecristo, odyssey], valid: [romeojuliet]}
+  # nein: {encoder: epic, train: [montecristo], valid: [romeojuliet]}
+## still buggy if we reshuffl the sources even though they are already tokenized!
