@@ -1,0 +1,27 @@
+# config.yaml -- what to ingest (§3), what to fit (§4), and how to split (§6).
+#
+# Tags are namespaced key:value. A key may repeat (two genre: tags is fine);
+# they are unused until split-level tag filtering lands (§7).
+#
+# A source is the smallest splittable unit, so validation holds out whole
+# sources: one book per uid keeps that choice open.
+
+sources:
+  montecristo: {urls: [https://gutenberg.org/cache/epub/1184/pg1184.txt],
+                tags: [source:gutenberg, lang:en, genre:fiction, author:dumas]}
+  romeojuliet: {urls: [https://gutenberg.org/cache/epub/1513/pg1513.txt],
+                tags: [source:gutenberg, lang:en, genre:drama, author:shakespeare]}
+  odyssey:     {urls: [https://gutenberg.org/cache/epub/1727/pg1727.txt],
+                tags: [source:gutenberg, lang:en, genre:fiction, author:homer]}
+
+encoders:
+  base: {kind: bpe, vocab_size: 5000,
+         special_tokens: ["<|endoftext|>", "<|begin|>", "<|end|>"],
+         fit_sources: [montecristo, romeojuliet]}
+
+# A split is a query over sources, not an artifact: it names which sources train
+# and which are held out, and both sides are encoded with the split's encoder.
+# Sources must exist under sources: above.
+splits:
+  main: {encoder: base, train: [montecristo], valid: [romeojuliet]}
+  nein: {encoder: base, train: [odyssey],     valid: [montecristo, romeojuliet]}

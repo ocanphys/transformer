@@ -221,6 +221,41 @@ def resolve_config(config: dict) -> dict:
     return resolved
 
 
+def serialize_config(config: dict) -> dict:
+    """Inverse of resolve_config: turn a live config -- real classes/functions, a
+    torch.dtype, a tuple of betas -- into a JSON-safe one, ready for json.dumps() ->
+    config.json. The three class/function refs become importable "module.qualname"
+    strings, the dtype a bare name like "float32", and betas a list; everything else
+    passes through untouched.
+
+    Only the fields resolve_config resolves are converted, so the two are exact
+    inverses -- serialize_config then resolve_config (or the round-trip through
+    config.json) yields an equivalent live config. Like its inverse it is forgiving:
+    values already in serialized form pass through, so calling it on an
+    already-serialized config is a no-op rather than an error.
+    """
+
+    def ref(obj):  # already a "module.qualname" string (re-serializing) -> leave it
+        return obj if isinstance(obj, str) else import_ref(obj)
+
+    serialized = dict(config)
+    serialized["model_class"] = ref(config["model_class"])
+    serialized["optimizer_class"] = ref(config["optimizer_class"])
+    serialized["lr_schedule_fn"] = ref(config["lr_schedule_fn"])
+
+    model_params = dict(config["model_params"])
+    dtype = model_params.get("dtype")
+    model_params["dtype"] = str(dtype).removeprefix("torch.") if isinstance(dtype, torch.dtype) else dtype
+    serialized["model_params"] = model_params
+
+    optimizer_params = dict(config["optimizer_params"])
+    if "betas" in optimizer_params:
+        optimizer_params["betas"] = list(optimizer_params["betas"])
+    serialized["optimizer_params"] = optimizer_params
+
+    return serialized
+
+
 def strip_optimizer_state(checkpoint_file: Path) -> None:
     """Rewrite a checkpoint file in place, dropping its optimizer state while
     keeping the model weights. No-op if the file has no optimizer state.

@@ -1,0 +1,189 @@
+"""Ingest (§3) and fit (§4), driven by config.yaml.
+
+    sources:  one job per source -- download its urls, concatenate EOS-separated
+              -> data/sources/{source_uid}/content.txt
+    encoders: one job per encoder -- fit BPE on its fit_sources' content.txt
+              -> data/tokenizers/{encoder_uid}/{tokenizer.joblib, config.json}
+    splits:   one job per (encoder, source) -- encode a source's content.txt
+              -> data/bins/{encoder_uid}/{source_uid}.bin
+
+    snakemake                # everything
+    snakemake montecristo    # one source, by uid
+    snakemake base           # one encoder, by uid (fetches what it needs first)
+    snakemake main           # one split's bins (fits the encoder first)
+    snakemake -n             # dry run
+    snakemake -F             # rebuild everything
+
+A split is a query over sources, not an artifact: train and valid name sources,
+and the only thing built per split is one .bin per source under the split's
+encoder. Two splits naming the same (encoder, source) pair share one .bin.
+
+Flags come from profiles/default/config.yaml, found automatically next to this
+file. Paths are absolute, so data lands in snaketl/data/ from any directory.
+"""
+
+import json
+from pathlib import Path
+
+import joblib
+
+from transformer.tokenizer import Tokenizer, train_bpe
+from transformer.util import download_and_concat, textfile_to_tokens_as_binary
+
+
+# Loads config.yaml into the global `config` dict.
+configfile: str(Path(workflow.basedir) / "config.yaml")
+
+
+# workflow.basedir is snaketl/. download_and_concat resolves output_path against
+# `volume`, so this is what puts /data beside this Snakefile.
+VOLUME = Path(workflow.basedir)
+DATA = VOLUME / "data"
+SOURCES = DATA / "sources"
+# Named "tokenizers" because that is where Tokenizer.from_files(uid, DATA) looks.
+TOKENIZERS = DATA / "tokenizers"
+BINS = DATA / "bins"
+
+# §3: files are joined by EOS, not a newline, so the encoder sees a boundary.
+EOS = "\n<|endoftext|>\n"
+
+
+def split_bins(split_uid: str) -> list[str]:
+    """The .bin files one split needs: its train and valid sources, encoded with
+    its encoder. Nothing distinguishes a train bin from a valid one on disk --
+    which side a source sits on is a fact about the split, not about the file."""
+    split = config["splits"][split_uid]
+    return [str(BINS / split["encoder"] / f"{uid}.bin") for uid in split["train"] + split["valid"]]
+
+
+# Default target -- the first rule runs when no target is named. Builds nothing
+# itself; asks for every source's content.txt, every encoder's artifacts, and
+# every split's bins.
+rule all:
+    input:
+        [str(SOURCES / uid / "content.txt") for uid in config["sources"]],
+        [str(TOKENIZERS / uid / "tokenizer.joblib") for uid in config["encoders"]],
+        [path for split_uid in config["splits"] for path in split_bins(split_uid)],
+
+
+# Fetch one source. No input: files -- its raw material is config.yaml, not
+# something on disk, so this is a leaf of the DAG: once content.txt exists it is
+# done. Editing the source's urls refetches it; -F forces one.
+rule write_content:
+    output:
+        # A pattern: {source_uid} is a wildcard, bound per job by the path asked
+        # for. Two sources means two jobs, run in parallel.
+        str(SOURCES / "{source_uid}" / "content.txt"),
+    params:
+        # A param, not a `config[...]` read inside run:. Snakemake compares
+        # params between runs, so an edited url list rebuilds content.txt; a read
+        # hidden inside run: would be invisible to it.
+        urls=lambda wildcards: config["sources"][wildcards.source_uid]["urls"],
+    # Fetches fail for boring reasons. Safe to retry: snakemake deletes a failed
+    # job's output, so no truncated content.txt survives.
+    retries: 3
+    run:
+        # output[0] is absolute; download_and_concat wants it relative to volume.
+        download_and_concat(
+            urls=params.urls,
+            output_path=str(Path(output[0]).relative_to(VOLUME)),
+            volume=VOLUME,
+            separator=EOS,
+        )
+
+
+# Fit one encoder on its fit_sources. Unlike write_content this rule has real
+# inputs, which is the whole edge between the two halves of the workflow:
+# asking for an encoder pulls in the content.txt it fits on, downloading any
+# that are missing, and refits whenever one of them changes.
+rule fit_encoder:
+    input:
+        # Lazy, because encoder_uid is only known once the wildcard is bound.
+        # The list order follows fit_sources.
+        lambda wildcards: [
+            str(SOURCES / uid / "content.txt")
+            for uid in config["encoders"][wildcards.encoder_uid]["fit_sources"]
+        ],
+    output:
+        # tokenizer.joblib is (vocab, merges); config.json is what it was fit
+        # with. Both names are what Tokenizer.from_files expects.
+        tokenizer=str(TOKENIZERS / "{encoder_uid}" / "tokenizer.joblib"),
+        config=str(TOKENIZERS / "{encoder_uid}" / "config.json"),
+    params:
+        kind=lambda wildcards: config["encoders"][wildcards.encoder_uid]["kind"],
+        vocab_size=lambda wildcards: config["encoders"][wildcards.encoder_uid]["vocab_size"],
+        special_tokens=lambda wildcards: config["encoders"][wildcards.encoder_uid]["special_tokens"],
+        fit_sources=lambda wildcards: config["encoders"][wildcards.encoder_uid]["fit_sources"],
+    run:
+        if params.kind != "bpe":
+            raise ValueError(f"encoder {wildcards.encoder_uid}: only kind: bpe is implemented, got {params.kind!r}")
+
+        # train_bpe takes the list straight: it pretokenizes each file and sums
+        # the counts, so this fits on the sources as one corpus without
+        # concatenating them into a temporary file first.
+        vocab, merges = train_bpe(list(input), params.vocab_size, params.special_tokens)
+
+        joblib.dump((vocab, merges), output.tokenizer)
+        Path(output.config).write_text(
+            json.dumps(
+                {
+                    "kind": params.kind,
+                    "vocab_size": params.vocab_size,
+                    "special_tokens": params.special_tokens,
+                    "fit_sources": params.fit_sources,
+                },
+                indent=2,
+            )
+        )
+
+
+# Encode one source with one encoder -- a flat uint16 token stream, memmap-ready.
+# One job per (encoder, source) pair, which is exactly what the two wildcards
+# carry, so adding a source to a split encodes just that source.
+rule encode_source:
+    input:
+        text=str(SOURCES / "{source_uid}" / "content.txt"),
+        # The encoder's artifacts are inputs like any other file, so refitting an
+        # encoder re-encodes every bin under it. Both are listed because
+        # Tokenizer.from_files reads both.
+        tokenizer=str(TOKENIZERS / "{encoder_uid}" / "tokenizer.joblib"),
+        encoder_config=str(TOKENIZERS / "{encoder_uid}" / "config.json"),
+    output:
+        str(BINS / "{encoder_uid}" / "{source_uid}.bin"),
+    run:
+        # DATA is the volume here: from_files looks under DATA/tokenizers, and
+        # textfile_to_tokens_as_binary takes both paths relative to it.
+        tokenizer = Tokenizer.from_files(wildcards.encoder_uid, DATA)
+        textfile_to_tokens_as_binary(
+            source_text=str(Path(input.text).relative_to(DATA)),
+            binary_target=str(Path(output[0]).relative_to(DATA)),
+            tokenizer=tokenizer,
+            volume=DATA,
+        )
+
+
+# `snakemake montecristo` / `snakemake base` / `snakemake main` instead of the
+# full path. Each is an empty rule asking for one artifact; the rules above are
+# what match those paths and do the work.
+for uid in config["sources"]:
+    rule:
+        name:
+            str(f"{uid}")
+        input:
+            str(SOURCES / uid / "content.txt"),
+
+
+for uid in config["encoders"]:
+    rule:
+        name:
+            str(f"{uid}")
+        input:
+            str(TOKENIZERS / uid / "tokenizer.joblib"),
+
+
+for uid in config["splits"]:
+    rule:
+        name:
+            str(f"{uid}")
+        input:
+            split_bins(uid),

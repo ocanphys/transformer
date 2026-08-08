@@ -33,10 +33,11 @@ def peek_top_pairs(pair_heap, pair_map, n=5):
     return results
 
 
-def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
+def train_bpe(input_path: str | Path | list[str | Path], vocab_size: int, special_tokens: list[str]):
     """
     Input
-        input_path: str  Path to a text file with BPE tokenizer training data.
+        input_path: str | Path | list  Path to a text file with BPE tokenizer training data,
+        or a list of such paths to fit on all of them as one corpus.
         vocab_size: int  A positive integer that defines the maximum final vocabulary size (including
         the initial byte vocabulary, vocabulary items produced from merging, and any special tokens).
         special_tokens: list[str]  A list of strings to add to the vocabulary. During training, treat
@@ -52,22 +53,29 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]):
         -> len(merges)+len(special_tokens) = len(vocab)-256,
         vocab will have special tokens in the beginning
     """
+    # One file or many is the same thing to the frequency map: each file is
+    # pretokenized on its own and the counts are summed. Equivalent to fitting on
+    # the concatenation, except no pretoken can span a file boundary -- the same
+    # guarantee the EOS separator gives inside a single file.
+    input_paths = [input_path] if isinstance(input_path, str | Path) else list(input_path)
+
     pattern = "|".join(re.escape(tok) for tok in special_tokens)
 
     freq = {}  # pretoken frequency map
     with tqdm(
-        total=os.path.getsize(input_path),
+        total=sum(os.path.getsize(path) for path in input_paths),
         desc="pretokenizing and building frequency map",
         unit="B",
         unit_scale=True,
     ) as pbar:
-        for chunk in process_chunks(input_path):
-            text = chunk.decode("utf-8")
-            segments = re.split(pattern, text) if pattern else [text]
-            for segment in segments:
-                for token in re.findall(PAT, segment):
-                    freq[token] = freq.get(token, 0) + 1
-            pbar.update(len(chunk))
+        for path in input_paths:
+            for chunk in process_chunks(path):
+                text = chunk.decode("utf-8")
+                segments = re.split(pattern, text) if pattern else [text]
+                for segment in segments:
+                    for token in re.findall(PAT, segment):
+                        freq[token] = freq.get(token, 0) + 1
+                pbar.update(len(chunk))
 
     pretoken_str, pretoken_freq = zip(*freq.items())
     pretokens = [list(pretoken.encode("utf-8")) for pretoken in pretoken_str]

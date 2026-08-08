@@ -28,6 +28,7 @@ dependencies = [
     "modal>=1.5.2",
     "nbstripout>=0.9.1",
     "nvidia-ml-py>=12.560",  # torch.cuda.utilization/power_draw/temperature/clock_rate need this for NVML
+    "snakemake>=9.25.1",
 ]
 
 [build-system]

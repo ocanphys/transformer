@@ -2,4 +2,5 @@ __pycache__/
 data/
 runs/
 tokenizers/
-.env
+.scratch/
+.snakemake/
