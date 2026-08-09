@@ -14,11 +14,12 @@ installed.
 """
 
 import asyncio
+import json
 
 import modal
 
 from app import JOB, APP_NAME, lease_key, leases, status, volume
-from jobs import RUNS, Aborted, read_config, run_dir
+from jobs import RUNS, Aborted, load_config, run_dir
 
 REFRESH_MS = 3000  # how often the page asks for fresh rows
 
@@ -69,6 +70,25 @@ def derive_status(complete: bool, done: int, live: str | None) -> str:
     return "orphaned"  # expired, or no lease key
 
 
+def live_step(run_id: str, call_id: str | None) -> int | None:
+    """The step this attempt last wrote to its own progress file, or None.
+
+    Display only, and never an input to a decision -- `JOB.progress` still reads
+    checkpoints, because only those are durable. This file is written with no
+    lease and published by Modal's background commits, so it is as fresh as those
+    happen to be and it can name a step whose work was never committed.
+
+    Missing is the normal case, not an error: a job that doesn't write one, an
+    attempt that hasn't reached its first step, or a commit that hasn't landed.
+    """
+    if call_id is None:
+        return None
+    try:
+        return json.loads((run_dir(run_id) / "logs" / call_id / "progress.json").read_text())["step"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 async def scan() -> list[dict]:
     """One row per run folder, newest first.
 
@@ -86,7 +106,7 @@ async def scan() -> list[dict]:
         if not rdir.is_dir():
             continue
         run_id = rdir.name
-        config = read_config(run_id)
+        config = load_config(run_id)
         try:
             if config is None:
                 raise Aborted("config.json missing or unparseable")
@@ -111,6 +131,9 @@ async def scan() -> list[dict]:
         row["attempt"] = grant["attempt"] if grant else None
         row["call_id"] = grant["call_id"] if grant else None
         row["status"] = derive_status(False, row["done"], state)
+        # Only for a run that is actually alive: the file outlives the attempt
+        # that wrote it, so on a dead run it would report a step nobody is on.
+        row["live_step"] = live_step(row["run_id"], row["call_id"]) if row["status"] in CANCELLABLE else None
 
     for row in runs:
         row.setdefault("status", "completed" if row.get("complete") else "orphaned")
@@ -208,7 +231,16 @@ def rows_html(runs: list[dict]) -> str:
         else:
             pct = min(100.0, 100 * done / total)
             progress = f"{done:,} / {total:,}"
-            bar = f"<div class='bar'><div class='fill' style='width:{pct:.1f}%'></div></div>"
+            # The bar is committed progress; the ghost ahead of it is where the
+            # live attempt has got to since its last checkpoint. Two different
+            # facts -- one survives a crash, the other does not -- so they are
+            # drawn differently rather than added together.
+            step = r.get("live_step")
+            ghost = ""
+            if step is not None and step > done:
+                ghost = f"<div class='fill live' style='width:{min(100.0, 100 * step / total):.1f}%'></div>"
+                progress += f" <span class='muted'>· at {step:,}</span>"
+            bar = f"<div class='bar'>{ghost}<div class='fill' style='width:{pct:.1f}%'></div></div>"
 
         if status_key in CANCELLABLE:
             action = f"<button class='cancel' data-act='cancel' data-run='{name}'>Cancel</button>"
@@ -283,8 +315,11 @@ def page_html(runs: list[dict]) -> str:
   .st-starting, .st-orphaned {{ color:var(--muted); font-weight:500; }}
   /* inline, not stacked above the numbers -- stacking is what made rows tall */
   .bar {{ display:inline-block; vertical-align:middle; margin-right:.5rem; width:110px; height:4px;
-          border-radius:2px; background:var(--line); overflow:hidden; }}
-  .fill {{ height:100%; background:#2da44e; transition:width .4s ease; }}
+          border-radius:2px; background:var(--line); overflow:hidden; position:relative; }}
+  /* both fills sit at left:0 and overlap; the solid one is later in the DOM, so it
+     paints over the ghost and what shows past it is the uncommitted stretch */
+  .fill {{ height:100%; background:#2da44e; transition:width .4s ease; position:absolute; left:0; top:0; }}
+  .fill.live {{ opacity:.3; }}
   button {{ font:inherit; font-size:.75rem; padding:.1rem .5rem; border-radius:5px; cursor:pointer;
             border:1px solid var(--line); background:transparent; color:var(--accent); }}
   button:hover {{ border-color:var(--accent); }}
