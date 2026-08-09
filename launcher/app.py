@@ -10,12 +10,23 @@ Three systems, each used only for what it is actually good at:
     Modal  = who is alive, now     (call state -- we ask, never write)
     Volume = what happened         (config, checkpoints, ledger, logs)
 
+Logging is not one of the three. `logs.py` owns it -- handlers, formatter, and
+the stdout capture that puts a job's print() in the same file as the protocol
+lines -- because it is process-wide interpreter state, not launcher logic.
+
 Three parts, and only the last is specific to what you are running:
 
-    launch    start or resume a run. Safe to call repeatedly.
-    work      one attempt: prove ownership, run the job, record why it stopped.
+    launch    start or resume a run. Safe to call repeatedly -- it spawns workers.
+    work      one worker: prove ownership, run the job, record why it stopped.
+              A worker is one container with one call id, having one go at one
+              run. `Worker` is its identity, `work` is what it does.
     JOB       the class this deployment runs; the toy counter here stands in
               for training.
+
+`etl` sits beside all of that rather than inside it: it runs the snaketl
+snakemake workflow in a container to build the data a run trains on. It needs no
+lease because a DAG of file targets is already idempotent -- the guarantee the
+lease buys is the one thing snakemake gives for free.
 
 How the guarantee works. `launch` runs one-at-a-time (max_containers=1) and is
 the only thing that ever writes the Dict, so a worker can never promote or
@@ -32,13 +43,15 @@ Usage:
     modal deploy launcher/app.py                       # deploy (do this first)
     modal run launcher/app.py --name alpha             # start a run
     modal run launcher/app.py --run-id 2026...._alpha  # resume it
+    modal run launcher/app.py::prepare --targets main  # build the data for one split
 """
 
 import json
-import logging
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import modal
 from modal.exception import Error, FunctionTimeoutError, OutputExpiredError
@@ -47,30 +60,26 @@ from modal.exception import Error, FunctionTimeoutError, OutputExpiredError
 # dependency runs one way (app -> jobs; jobs never imports app), so there is no
 # cycle, and Aborted has one definition -- the class app.py catches here is the
 # same one Count raises there.
-from jobs import Aborted, Count, mint_run_id, read_config, run_dir
+from jobs import Aborted, Count, mint_run_id, load_config, run_dir
+
+# All the process-wide logging state -- handlers, formatter, stdout capture --
+# lives in logs.py. A worker holds one WorkerLog and nothing else of it.
+from logs import WorkerLog
 
 APP_NAME = "training-launcher"
 VOLUME_NAME = "test-volume"  # flip to "LLM-pretraining" once the real trainer is wired in
 DICT_NAME = "training-leases"
 
+# Where the snaketl workflow lives on each side. PROJECT_ROOT is derived from
+# __file__ rather than imported from config.py because only launcher/ is on the
+# path in a container -- and it is a local-only value anyway, read while the
+# image is being described, never inside one.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SNAKETL = "/snaketl"  # the workflow definition, read-only, shipped with the image
+STORAGE = "/storage"  # the Volume: where the workflow's artifacts and its metadata land
+
 LEASE_RETRIES = 5  # how many times an indeterminate lease read is worth re-asking
 LEASE_BACKOFF = 5.0  # seconds x try number -> 5, 10, 15, 20: ~50s of patience in total
-
-# What lands in an attempt's log. Root sits at LOG_LEVEL so anything anyone logs
-# is captured by default; LOG_LEVELS pins the chatty libraries down so their
-# noise cannot bury the run's own story. Add a name here when something new gets
-# loud, or set one to DEBUG when you need to see inside it.
-LOG_LEVEL = logging.INFO
-LOG_LEVELS = {
-    "modal": logging.WARNING,
-    "modal-client": logging.WARNING,
-    "grpclib": logging.WARNING,
-    "httpx": logging.WARNING,
-    "httpcore": logging.WARNING,
-    "urllib3": logging.WARNING,
-    "asyncio": logging.WARNING,
-    "filelock": logging.WARNING,
-}
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -80,88 +89,36 @@ leases = modal.Dict.from_name(DICT_NAME, create_if_missing=True)
 # uv_sync image from modal_lab/run.ipynb -- only this line changes.
 base_image = modal.Image.debian_slim(python_version="3.12")
 
-# jobs.py rides along on every image: app.py imports it at module load, so it must
-# be present in any container that imports app.py -- launch, work, and dashboard.
+# jobs.py and logs.py ride along on every image: app.py imports both at module
+# load, so they must be present in any container that imports app.py -- launch,
+# work, dashboard, and etl alike. Miss one and the container fails on import,
+# before any of this code gets a chance to run.
 # add_local_* has to come last in a chain (Modal adds these files at container
 # startup rather than baking them in, so editing jobs.py never rebuilds the image);
 # any build step like pip_install must therefore run before it.
-image = base_image.add_local_python_source("jobs")
+LOCAL_MODULES = ("jobs", "logs")
+
+image = base_image.add_local_python_source(*LOCAL_MODULES)
 
 # The dashboard needs a web server, and its own module shipped alongside this one.
-web_image = base_image.pip_install("fastapi[standard]").add_local_python_source("jobs", "dashboard")
+web_image = base_image.pip_install("fastapi[standard]").add_local_python_source(*LOCAL_MODULES, "dashboard")
 
-logger = logging.getLogger(__name__)
-
-
-# --------------------------------------------------------------------------------------
-# logging: everything an attempt does, in the attempt's own file
-# --------------------------------------------------------------------------------------
-
-
-class AttemptFormatter(logging.Formatter):
-    """`<iso-timestamp> <message>`, in UTC.
-
-    The first column is a contract, not a style choice: the dashboard merges every
-    attempt's log for a run by sorting on it, and that only works because the
-    timestamps are one fixed-width UTC format. `converter = time.gmtime` is what
-    keeps them UTC even on a machine that thinks otherwise.
-
-    Our own lines stay bare. Anything from another library gets its level and
-    logger name in front, so foreign noise is identifiable at a glance without
-    cluttering the run's own story.
-    """
-
-    converter = time.gmtime
-
-    def __init__(self):
-        super().__init__(fmt="%(asctime)s.%(msecs)03dZ %(prefix)s%(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
-
-    def format(self, record):
-        record.prefix = "" if record.name == __name__ else f"{record.levelname} {record.name}: "
-        return super().format(record)
-
-
-def _remove_attempt_handlers(root: logging.Logger) -> None:
-    """Drop and close any handler an earlier attempt left behind. Identified by a
-    marker attribute rather than by identity, so this works even when the attempt
-    that installed them is long gone -- which is exactly the case that matters,
-    since a leftover handler points at a previous run's file."""
-    for handler in list(root.handlers):
-        if getattr(handler, "_attempt_handler", False):
-            root.removeHandler(handler)
-            handler.close()
-
-
-class StdoutToLog:
-    """Sends `print()` through the logger instead of straight to the console.
-
-    Line-buffered, because print writes its text and its newline separately and a
-    half-line is not a log record. Nothing is written to the real stream here --
-    the logger's own console handler does that, so each line still reaches Modal's
-    logs exactly once, and there is no way to loop back into ourselves.
-
-    Only stdout is taken. tqdm and friends write to stderr, and their carriage-
-    return redraws would turn a training log into tens of thousands of fragments.
-    """
-
-    def __init__(self, log):
-        self.log = log
-        self.buffer = ""
-
-    def write(self, text):
-        self.buffer += text
-        while "\n" in self.buffer:
-            line, _, self.buffer = self.buffer.partition("\n")
-            if line.strip():
-                self.log(line)
-        return len(text)
-
-    def flush(self):
-        pass
-
-    def isatty(self):
-        return False
-
+# The ETL container runs the snaketl workflow, so unlike the toy worker it needs
+# the real project environment: uv_sync installs pyproject.toml's dependencies
+# (snakemake, joblib, regex, ...) from the lockfile, and `transformer` itself
+# rides along as local source because the Snakefile imports from it directly.
+#
+# The Snakefile, its config.yaml and its profile come over as a plain directory:
+# add_local_python_source only ships importable modules, and none of these are.
+# data/ and .snakemake/ are excluded because they are the workflow's *output* --
+# the container builds those on the Volume, and shipping a laptop's copy would
+# both bloat the mount and plant stale artifacts where snakemake would trust them.
+etl_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_sync(uv_project_dir=PROJECT_ROOT)
+    .add_local_python_source(*LOCAL_MODULES, "transformer")
+    .add_local_dir(PROJECT_ROOT / "snaketl", SNAKETL, ignore=["data", ".snakemake", "**/__pycache__"])
+)
 
 # --------------------------------------------------------------------------------------
 # liveness: the single source of truth for "is that call still running?"
@@ -249,7 +206,7 @@ def fence(run_id: str, my_call_id: str) -> tuple[str, dict | None]:
 # the volume: what happened
 # --------------------------------------------------------------------------------------
 #
-# run_dir, read_config, and mint_run_id -- the folder layout every run shares --
+# run_dir, load_config, and mint_run_id -- the folder layout every run shares --
 # live in jobs.py, the leaf both the launcher here and the jobs there import from.
 
 
@@ -308,7 +265,7 @@ async def launch(run_id: str | None = None, name: str = "run", config: dict | No
 
     # L7 -- no readable config. A run whose definition is gone gets quarantined,
     # never guessed at.
-    config = read_config(run_id)
+    config = load_config(run_id)
     if config is None:
         return {"run_id": run_id, "reason": "no readable config.json -- orphaned", "call_id": None}
 
@@ -337,15 +294,20 @@ async def launch(run_id: str | None = None, name: str = "run", config: dict | No
     # has none. Clear the old key, spawn, then grant.
     #
     # Clearing before the spawn matters. Between spawn and grant the key still
-    # holds the dead attempt's id, and a warm container can boot fast enough to
+    # holds the dead worker's id, and a warm container can boot fast enough to
     # read it -- an occupied key means "someone else owns this", so the new worker
     # would kill itself over a lease that is milliseconds from being its own.
     # Clearing first makes that gap an empty key, which just means "wait".
 
     await leases.pop.aio(lease_key(run_id), None)
+    # An ordinal, not an entity: this is attempt 2 *at* the run, and the worker
+    # making it is named by call id. Only the count lives here.
     attempt = (grant["attempt"] + 1) if grant else 1
     call = await work.spawn.aio(run_id)
-    await leases.put.aio(lease_key(run_id), {"call_id": call.object_id, "granted_ts": time.time(), "attempt": attempt})
+    await leases.put.aio(
+        lease_key(run_id),
+        {"call_id": call.object_id, "granted_ts": time.time(), "attempt": attempt},
+    )
 
     return {
         "run_id": run_id,
@@ -359,12 +321,20 @@ async def launch(run_id: str | None = None, name: str = "run", config: dict | No
 # --------------------------------------------------------------------------------------
 
 
-class Attempt:
-    """One attempt at one run: who this container is and where it logs.
+class Worker:
+    """Who this worker is and where it logs.
 
-    Jobs never get one of these. They get `make_lease()` -- permission, without
-    the identity behind it -- because the only thing a job needs from an attempt
-    is the right to make its writes durable.
+    A worker is one container having one go at one run, and its call id -- unique
+    forever, minted by the spawn that created it -- is its whole identity. That
+    id is what the lease names, what the log folder is called, and what the ledger
+    stamps rows with, so "which worker" always has exactly one answer.
+
+    `work` is the body that goes with this identity; the two are one thing split
+    only because a class is how you hold state across a `with`.
+
+    Jobs never get one of these. They get what `bind_lease()` returns --
+    permission, without the identity behind it -- because the only thing a job
+    needs from a worker is the right to make its writes durable.
     """
 
     def __init__(self, run_id: str):
@@ -384,7 +354,7 @@ class Attempt:
         # old our folder snapshot is when we read it -- one Dict round-trip's
         # worth. It also cannot make that read authoritative: a superseded worker
         # that passed its gate before the takeover may still commit afterwards,
-        # and that commit hasn't happened yet when we reload. See make_lease.
+        # and that commit hasn't happened yet when we reload. See bind_lease.
         volume.reload()
 
         self.run_id = run_id
@@ -392,51 +362,13 @@ class Attempt:
         self.rdir = run_dir(run_id)
         self.logdir = self.rdir / "logs" / self.call_id
         self.logdir.mkdir(parents=True, exist_ok=True)
-        self._capture_logging()
 
-    def _capture_logging(self) -> None:
-        """Point everything this container logs at this attempt's own file.
-
-        Handlers go on the *root* logger, so any code anywhere -- ours, a job's, a
-        library's -- is captured without being asked to cooperate. A job holds only
-        a lease and has no route back to us, so this is what lets it log at all:
-        `logging.getLogger(__name__)` from anywhere lands in the right file.
-
-        Two handlers, on purpose: the file is the durable record that ships with
-        the run folder, the console keeps `modal app logs` working. print() is
-        routed through the logger rather than the console handler's stream, so it
-        appears in both, once each, and cannot loop back into itself.
-
-        Old handlers of ours are torn off first. Containers are reused, and a
-        leftover handler still points at the *previous* run's file -- which would
-        quietly write this attempt's lines into another run's folder.
-
-        Must run after volume.reload(): reloading fails while a file on the volume
-        is open, and this opens one.
-        """
-        root = logging.getLogger()
-        _remove_attempt_handlers(root)
-
-        self._file_handler = logging.FileHandler(self.logdir / "attempt.log")
-        self._console_handler = logging.StreamHandler(sys.stdout)
-        for handler in (self._file_handler, self._console_handler):
-            handler.setFormatter(AttemptFormatter())
-            handler._attempt_handler = True  # so a later attempt can find and drop it
-            root.addHandler(handler)
-
-        root.setLevel(LOG_LEVEL)
-        for name, level in LOG_LEVELS.items():
-            logging.getLogger(name).setLevel(level)
-        logging.captureWarnings(True)  # warnings.warn -> the log, not the void
-
-        self._stdout = sys.stdout
-        sys.stdout = StdoutToLog(self.log)
-
-    def _release_logging(self) -> None:
-        """Undo it, in the reverse order. Restoring stdout first means a late
-        print during teardown still has somewhere real to go."""
-        sys.stdout = self._stdout
-        _remove_attempt_handlers(logging.getLogger())
+        # Redirects this whole container's logging into this worker's own file,
+        # and keeps it there until release(). Constructed here, after
+        # volume.reload(): reloading fails while a file on the volume is open,
+        # and this opens one.
+        #
+        self._log = WorkerLog(self.logdir / "worker.log")
 
     def __enter__(self):
         return self
@@ -446,7 +378,7 @@ class Attempt:
 
         The traceback is written here, while the file handler is still attached --
         otherwise the one event most worth having a record of is the one event
-        that never reaches the record. Worded as an EXIT so every attempt ends
+        that never reaches the record. Worded as an EXIT so every worker ends
         with exactly one, however it ended.
 
         Nothing is committed on this path. Modal commits mounted volumes when a
@@ -454,29 +386,23 @@ class Attempt:
         would publish whatever else the job left dirty mid-failure.
         """
         if exc_type is not None:
-            logger.error("EXIT crashed: %r", exc, exc_info=(exc_type, exc, tb))
-        self._release_logging()
+            self._log.crashed(exc, (exc_type, exc, tb))
+        self._log.release()
         return False  # never swallow: work() still needs to see it and re-raise
 
     def log(self, msg: str) -> None:
-        """Write one line to this attempt's log.
-
-        Sugar over the module logger, so protocol lines and everything else land
-        in the same file through the same path. The folder is named by a call id
-        that is unique forever, so attempts can never overwrite each other's logs,
-        and even a superseded one can safely flush its last words.
-        """
-        logger.info(msg)
+        """Write one line to this worker's log. See logs.WorkerLog.log."""
+        self._log.log(msg)
 
     def log_exit(self, reason: str) -> dict:
         """Say why we are leaving, publish it, and hand the caller its return
         value. The caller does the actual leaving.
 
-        There are two ways out of an attempt and this is the tidy one, reached
+        There are two ways out of a worker and this is the tidy one, reached
         when we decided to stop: finished, denied, or handed a folder we cannot
         run. The other is __exit__, for when something threw.
 
-        The commit is leaseless, which is safe only because attempt.log is the one
+        The commit is leaseless, which is safe only because the log is the one
         dirty file -- commits publish the whole container, not one path. A job
         that writes shared files continuously, instead of buffering to a
         checkpoint the way `Count` does, has to deal with that; see `pending`.
@@ -485,40 +411,35 @@ class Attempt:
         volume.commit()
         return {"run_id": self.run_id, "reason": reason}
 
-    def make_lease(self, tries: int = LEASE_RETRIES, backoff: float = LEASE_BACKOFF):
-        """Hand out permission to write, as two ways of using one check:
+    def bind_lease(self, tries: int = LEASE_RETRIES, backoff: float = LEASE_BACKOFF):
+        """Tie this worker to the lease `launch` granted it, and gate commits on it.
 
-            lease.confirm("fence-in")     # just prove we own the run
-            with lease(commit=True):      # prove it, then make the block durable
+        Nothing here grants anything -- the lease is the Dict entry and only
+        `launch` ever writes one. This is the reading half: check that grant
+        against our own call id, and refuse to commit without it. Two surfaces
+        over that one check, so proving ownership need not pretend to be a block:
 
-        `confirm` exists so proving ownership doesn't have to pretend to be a
-        block. A `with` whose exit does nothing is just a function call with extra
-        indentation, and it reads like a second gate when only one ever commits.
+            lease.confirm("fence-in")        # just prove the grant still names us
+            with lease(label, commit=True):  # prove it, run the block, commit
+                write_checkpoint(...)
 
-        A closure, not a method, so it can travel alone: a job holds `lease` and
-        nothing else of ours. `lease.call_id` comes along because a job keeping a
-        ledger needs to stamp rows with who wrote them, and that is the only thing
-        about us it needs to know.
-
-        Retry settings are fixed here and captured, so callers ask for permission
-        rather than for a number of tries. One setting covers both uses; if
-        fence-in ever wants its own, call make_lease again with other arguments.
+        A closure so a job can hold it and nothing else of ours; `lease.call_id`
+        rides along only because a ledger stamps rows with who wrote them. Retry
+        settings are captured here, so callers ask for permission rather than for
+        a number of tries.
         """
 
         def confirm(label: str = "lease") -> None:
-            """Prove we still own the run, or raise LeaseLost.
+            """Prove the grant still names us, or raise LeaseLost.
 
-            Someone else's id raises immediately -- that is a real answer, and
-            asking again is just hoping it changes. Only silence is worth waiting
-            out, and only briefly. Waiting is safe even if a takeover is genuinely
-            underway: the launcher checks Modal before taking a run, and a worker
-            that has merely lost the Dict still looks alive there, so nobody can
-            take our lease while we wait.
+            Someone else's id is a real answer, so it raises at once; only
+            UNKNOWN (see `fence`) is worth waiting out, and only briefly. Waiting
+            cannot cost us the run: the launcher checks Modal for liveness before
+            reassigning, and a worker that has merely lost the Dict still looks
+            alive there.
 
-            Every check is logged, including the ones that pass. A boundary that
-            committed and a boundary that was allowed to commit are different
-            facts, and after the event only the log can tell them apart -- an
-            ownership check that quietly succeeded leaves nothing else behind.
+            Passes are logged too -- afterwards, only the log distinguishes a
+            boundary that committed from one that was merely allowed to.
             """
             for i in range(1, tries + 1):
                 verdict, grant = fence(self.run_id, self.call_id)
@@ -526,7 +447,7 @@ class Attempt:
                     self.log(f"{label}: lease held (attempt {grant['attempt']}, try {i}/{tries})")
                     return
                 if verdict == MISMATCH:
-                    raise LeaseLost(f"{label}: another attempt holds this run ({grant['call_id']})")
+                    raise LeaseLost(f"{label}: another worker holds this run ({grant['call_id']})")
                 if i == tries:
                     raise LeaseLost(f"{label}: indeterminate after {tries} tries -- ownership never confirmed")
                 self.log(f"{label}: indeterminate, retry {i}/{tries}")
@@ -534,32 +455,20 @@ class Attempt:
 
         @contextmanager
         def lease(label: str = "lease", commit: bool = False):
-            """Prove we own the run, run the block, then commit if asked.
+            """Prove ownership, run the block, then commit if asked.
 
-                with lease(f"step {step}", commit=True):
-                    write_checkpoint(...)
+            The commit is the only irreversible thing a worker does: everything
+            before it dies with the container, so being denied costs work, never
+            history. A raising block skips it -- a half-written checkpoint is not
+            a checkpoint.
 
-            The commit is the only irreversible thing a worker does. Everything
-            written before it exists only in this container and disappears with
-            it, so being denied costs work, never history. If the block raises,
-            the commit is skipped -- a half-written checkpoint is not a
-            checkpoint.
-
-            This does not mean "only one writer at any instant". The check and the
-            commit talk to two different services and cannot be made atomic, so
-            the lease can move while the block runs, and any worker can land a
-            commit it was authorized for a moment ago. The real guarantee is
-            weaker but enough: nobody commits without having proved ownership
-            since their last commit.
-
-            That gap is as wide as the block is slow, which ties it to checkpoint
-            size -- the toy writes a few bytes, but torch.save of a large model
-            plus the upload holds it open for seconds. Widening it corrupts
-            nothing: checkpoints are written once per step number, so a redone
-            interval overwrites itself from the same starting point, and the
-            ledger tolerates repeated steps. The cost is one interval done twice.
-            If that ever matters, shorten the block -- write the file outside the
-            gate and let the gated part do only the rename and commit.
+            This is not mutual exclusion at an instant. The check and the commit
+            hit two different services and cannot be atomic, so the lease can move
+            mid-block. The guarantee is weaker and sufficient: nobody commits
+            without having proved ownership since their last commit. The gap is as
+            wide as the block is slow, and costs at most one interval done twice
+            (checkpoints overwrite per step, the ledger tolerates repeats).
+            Shorten the block if that ever matters.
             """
             confirm(label)
 
@@ -576,55 +485,57 @@ class Attempt:
 
 @app.function(image=image, volumes={"/storage": volume}, timeout=3600, retries=0)
 def work(run_id: str) -> dict:
-    """One attempt at one run.
+    """One worker: prove ownership, hand the lease to the job, record why we stopped.
 
-    Everything is wrapped because of one ambiguity: Modal signals "still running"
-    by raising a builtin TimeoutError, and it also re-raises whatever the worker
-    raised. So a worker that dies on a socket or dataloader timeout -- both are
-    builtin TimeoutError since Python 3.10 -- would read as healthy forever, and
-    the launcher would refuse to resume it. Re-raising as RuntimeError guarantees
-    every failure reads as a failure.
+    This is the body of a worker, and `Worker` is its identity -- there is no
+    third thing between them. Nothing here knows what the job does: not its
+    config, not its layout, not what "done" means to it. And the job never learns
+    a lease exists; it enters a context manager when it wants something to
+    survive, and a denied gate raises straight through its own loop.
+
+    The whole body is wrapped because of one ambiguity: Modal signals "still
+    running" by raising a builtin TimeoutError, and it also re-raises whatever the
+    worker raised. So a worker that dies on a socket or dataloader timeout -- both
+    are builtin TimeoutError since Python 3.10 -- would read as healthy forever,
+    and the launcher would refuse to resume it. Re-raising as RuntimeError
+    guarantees every failure reads as a failure.
+
+    The `with` sits inside that wrapper, so a crash still runs `Worker.__exit__`
+    -- which writes the traceback while the log file is still attached -- before
+    the failure is reworded on the way out.
     """
     try:
-        return _attempt(run_id)
+        # A context manager because of what it installs, not what it holds: log
+        # capture is process-wide state, and a reused container must never carry
+        # one worker's handlers into the next run.
+        with Worker(run_id) as worker:
+            worker.log(f"boot call_id={worker.call_id}")
+
+            # The launcher granted this run's lease when it spawned us; this ties
+            # it to our call id. The one thing a job needs from us, under the name
+            # it will use it by.
+            lease = worker.bind_lease()
+
+            try:
+                # Prove ownership before doing anything at all, including reading
+                # the job's own config. The retries here cover the launcher's gap
+                # between spawn and grant, plus ordinary network hiccups. Nothing
+                # is written, so there is nothing to commit.
+                lease.confirm("fence-in")
+                job = JOB(lease, run_id)
+                job.run()
+            except Aborted as e:
+                return worker.log_exit(str(e))
+
+            # Ask the job's progress rather than trust a return value. A job is
+            # just code that runs once it holds the lease; requiring it to report
+            # a step count would force every future job to keep one. This is the
+            # same call the launcher makes over the same committed files, so both
+            # read one truth.
+            done, total = JOB.progress(job.rdir, job.config)
+            return worker.log_exit(f"finished at {done}/{total}")
     except Exception as e:
-        raise RuntimeError(f"attempt failed for {run_id}: {e!r}") from e
-
-
-def _attempt(run_id: str) -> dict:
-    """Prove ownership, hand the lease to the job, record why we stopped.
-
-    Nothing here knows what the job does -- not its config, not its layout, not
-    what "done" means to it. And the job never learns a lease exists: it just
-    enters a context manager when it wants something to survive, and a denied
-    gate raises straight through its own loop.
-    """
-    # A context manager because of what it installs, not what it holds: log capture
-    # is process-wide state, and a reused container must never carry one attempt's
-    # handlers into the next run.
-    with Attempt(run_id) as attempt:
-        attempt.log(f"boot call_id={attempt.call_id}")
-
-        # The one thing a job needs from us, under the name it will use it by.
-        lease = attempt.make_lease()
-
-        try:
-            # Prove ownership before doing anything at all, including reading the
-            # job's own config. The retries here cover the launcher's gap between
-            # spawn and grant, plus ordinary network hiccups. Nothing is written, so
-            # there is nothing to commit.
-            lease.confirm("fence-in")
-            job = JOB(lease, run_id)
-            job.run()
-        except Aborted as e:
-            return attempt.log_exit(str(e))
-
-        # Ask the job's progress rather than trust a return value. A job is just
-        # code that runs once it holds the lease; requiring it to report a step
-        # count would force every future job to keep one. This is the same call the
-        # launcher makes over the same committed files, so both read one truth.
-        done, total = JOB.progress(job.rdir, job.config)
-        return attempt.log_exit(f"finished at {done}/{total}")
+        raise RuntimeError(f"worker failed for {run_id}: {e!r}") from e
 
 
 # What this deployment runs. One name, so the launcher and the worker cannot
@@ -662,6 +573,86 @@ def dashboard():
 
 
 # --------------------------------------------------------------------------------------
+# the ETL: the snaketl workflow, run against the Volume
+# --------------------------------------------------------------------------------------
+
+
+@app.function(image=etl_image, volumes={STORAGE: volume}, cpu=4, timeout=3600, max_containers=1)
+def etl(targets: list[str] | None = None, flags: list[str] | None = None, unlock: bool = False) -> dict:
+    """Run `snakemake` in a container, with the Volume as its data directory.
+
+    Same targets and flags as the local command -- `etl(["main"], ["-n"])` is
+    `snakemake main -n` -- because this shells out to the real snakemake rather
+    than reimplementing any part of it. Two arguments are supplied here and are
+    not yours to pass:
+
+        --directory /storage   the working directory, so .snakemake/ (the metadata
+                               that decides what needs rebuilding) survives the
+                               container instead of dying with it
+        --config volume=...    where artifacts go. The Snakefile defaults this to
+                               its own folder, which here is a read-only image
+                               mount, so it has to be redirected at the Volume.
+
+    Those two are the whole reason a container can do incremental builds at all:
+    with either one missing, every invocation starts from an empty tree and
+    rebuilds the world.
+
+    What to build is read from the Volume too -- /storage/data/config.yaml, which
+    the Snakefile locates from that same `volume` value. It is not in the image,
+    so changing which sources exist is an upload rather than a redeploy:
+
+        modal volume put test-volume snaketl/data/config.yaml /data/config.yaml --force
+
+    and it has to be there before the first call, or snakemake raises on the
+    missing configfile.
+
+    No lease, unlike `work`. This is a different shape of job -- a DAG that is
+    idempotent by construction, where a crashed run leaves finished outputs in
+    place and re-running resumes from them. What it does need is to not race
+    itself, and `max_containers=1` gives that the same way it does for `launch`.
+    Snakemake's own directory lock is the backstop, and it is why `unlock` exists:
+    a container killed mid-run (a cancel, a timeout) leaves that lock behind on
+    the Volume, and the next call refuses to start until someone clears it.
+    """
+    volume.reload()  # containers are reused; start from what previous runs committed
+
+    # Targets go first, before any option. `--config` takes a variable-length list
+    # of key=value pairs, so anything non-dash that follows it is swallowed as
+    # another pair -- a trailing target becomes `Invalid config definition`. Ending
+    # the line with --config, and putting the only positional arguments up front,
+    # is what keeps that from depending on whether `flags` happens to be empty.
+    argv = [
+        sys.executable,
+        "-m",
+        "snakemake",
+        *(targets or []),
+        "--snakefile",
+        f"{SNAKETL}/Snakefile",
+        "--directory",
+        STORAGE,
+        "--workflow-profile",
+        f"{SNAKETL}/profiles/default",
+        *(["--unlock"] if unlock else []),
+        *(flags or []),
+        "--config",
+        f"volume={STORAGE}",
+    ]
+    print(f"$ {' '.join(argv)}")
+    result = subprocess.run(argv)
+
+    # Commit either way. A failed workflow still finished some of its jobs, and
+    # those outputs plus the metadata describing them are exactly what makes the
+    # next run skip them -- discarding that is what would make failure costly.
+    # (snakemake deletes the output of the job that failed, so nothing half-written
+    # is being kept here.)
+    volume.commit()
+
+    if result.returncode:
+        raise RuntimeError(f"snakemake exited {result.returncode}")
+    return {"targets": targets or ["all"], "returncode": result.returncode}
+
+
+# --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
 
@@ -677,8 +668,30 @@ def main(run_id: str = "", name: str = "run", total_steps: int = 20, save_every:
     launcher = modal.Function.from_name(APP_NAME, "launch")
     if run_id:
         # A resume passes no config at all: config.json was written once, at
-        # creation, and every attempt since runs under it.
+        # creation, and every worker since runs under it.
         print(launcher.remote(run_id=run_id))
     else:
         config = JOB.make_config(total_steps=total_steps, save_every=save_every, step_seconds=step_seconds)
         print(launcher.remote(name=name, config=config))
+
+
+@app.local_entrypoint()
+def prepare(targets: str = "", flags: str = "", unlock: bool = False):
+    """Run the snaketl workflow on Modal.
+
+        modal run launcher/app.py::prepare                          # everything
+        modal run launcher/app.py::prepare --targets "main split"   # named targets
+        modal run launcher/app.py::prepare --flags "-n"             # dry run
+        modal run launcher/app.py::prepare --unlock                 # clear a stale lock
+
+    Targets and flags arrive as one string each and are split on whitespace,
+    because a `modal run` entrypoint only takes scalars. That rules out any
+    argument containing a space -- none of ours do, and the alternative is
+    quoting rules nobody wants to learn for a wrapper this thin.
+
+    Unlike `main`, this calls `etl.remote` on the local app rather than reaching
+    for the deployed one. `main` needs `Function.from_name` because `launch`'s
+    single-container lock only means anything within one deployment; the workflow
+    has no such lock to protect, so running it from here is the same job.
+    """
+    print(etl.remote(targets=targets.split(), flags=flags.split(), unlock=unlock))

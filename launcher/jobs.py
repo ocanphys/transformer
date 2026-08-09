@@ -11,9 +11,9 @@ RUNS = Path("/storage/runs")  # volume mount path, as seen inside the containers
 
 
 class Aborted(Exception):
-    """Stop this attempt, but it is not a crash -- leaving is the right answer.
+    """Stop this worker, but it is not a crash -- leaving is the right answer.
 
-    `_attempt` catches this and logs a clean exit. Anything else that escapes is
+    `work` catches this and logs a clean exit. Anything else that escapes is
     a bug and gets reported as one. Jobs raise this when handed a folder they
     cannot run.
     """
@@ -58,11 +58,11 @@ class Job(ABC):
 
     The method kinds carry the split. `run` is an instance method -- it needs the
     lease. `progress` and `make_config` are classmethods, because the launcher
-    calls them with no attempt and no lease in hand: to decide a folder is finished
+    calls them with no worker and no lease in hand: to decide a folder is finished
     before spawning anyone, and to mint a config at the CLI.
 
     Subclassing is enforcement, not decoration: a job missing `run` cannot be
-    instantiated, so `JOB = SomeJob` fails at deploy, not mid-attempt.
+    instantiated, so `JOB = SomeJob` fails at deploy, not mid-run.
 
     The durability rule every job lives under. A commit is the only irreversible
     thing a worker does, and it publishes the whole container, not one path -- so
@@ -76,7 +76,7 @@ class Job(ABC):
     """
 
     def __init__(self, lease, run_id: str):
-        # A lease and a folder is everything a job gets. No Attempt, so no route to
+        # A lease and a folder is everything a job gets. No Worker, so no route to
         # identity, logging, or the Dict; the one useful fact -- which call is
         # writing -- rides along on the lease.
         #
@@ -122,7 +122,7 @@ class Job(ABC):
         One row per step, merged across calls, so a step's loss and the val_loss
         computed after it land as one row rather than two. `ts` is stamped on
         first sight of the step -- when the step happened, not when it was
-        flushed -- and `call_id` records which attempt produced it.
+        flushed -- and `call_id` records which worker produced it.
 
         Values are stored exactly as handed over, which is the point for GPU
         metrics: a 0-dim cuda tensor costs a few bytes to keep and nothing to
@@ -176,7 +176,7 @@ class Job(ABC):
         the one label for the boundary: the lease logs its ownership check under
         it, the commit is logged under it, and it is what we log here -- so a
         checkpoint that committed and a checkpoint that was merely allowed to
-        commit read as the same event in the attempt log, told apart by which
+        commit read as the same event in the worker log, told apart by which
         lines follow.
 
         If we were superseded, entering the lease raises LeaseLost and `write` is
@@ -203,7 +203,7 @@ class Job(ABC):
     def run(self) -> None:
         """Carry this folder forward while the lease holds.
 
-        Takes and returns nothing, which is what makes an attempt safe to repeat:
+        Takes and returns nothing, which is what makes a worker safe to repeat:
         where to start comes from the folder (`progress`), not an argument, and
         what got done comes from the folder afterwards, not a return value. So a
         job can be any code at all, rather than something obliged to count steps.
@@ -289,13 +289,13 @@ class Train(Job):
         nothing here touches a tensor.
 
         Logging here, at the boundary, is also what keeps W&B's step monotonic
-        across attempts -- and wandb refuses to log to a step it has already
+        across workers -- and wandb refuses to log to a step it has already
         passed. Rows reach both the ledger and W&B only at a committed boundary,
-        so an attempt that dies mid-interval sent neither, and the attempt that
+        so a worker that dies mid-interval sent neither, and the worker that
         resumes from the last checkpoint re-runs those steps against a W&B run
         whose step is exactly that checkpoint. The one gap: if the commit itself
         fails after this returns, W&B keeps rows the ledger never got, and the
-        resumed attempt's numbers for those steps are dropped as backwards.
+        resumed worker's numbers for those steps are dropped as backwards.
 
         This runs inside the lease block, so it widens the window between the
         ownership check and the commit -- by a burst of save_every buffered
@@ -687,7 +687,7 @@ class Train(Job):
         except BaseException:
             # Say so now rather than leaving wandb to notice a missing heartbeat
             # minutes later. Note this also fires when we were superseded, which
-            # is a clean stop -- it marks a run another attempt may already be
+            # is a clean stop -- it marks a run another worker may already be
             # training as failed.
             self.wb.fail()
             raise
