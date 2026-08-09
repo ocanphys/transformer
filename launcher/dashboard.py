@@ -93,7 +93,7 @@ async def scan() -> list[dict]:
     """One row per run folder, newest first.
 
     Reloads the volume first: this container is long-lived, so its snapshot is
-    stale by default -- the same reason `launch` and `Attempt` reload.
+    stale by default -- the same reason `launch` and `work` reload.
 
     Liveness is asked only about runs that are not finished, and all of those
     questions go out together, so the page costs one round-trip rather than one
@@ -149,13 +149,13 @@ async def _no_lease():
 
 
 async def read_logs(run_id: str) -> list[tuple[str, str, str]]:
-    """Every attempt's log for one run, merged into one stream in time order.
+    """Every worker's log for one run, merged into one stream in time order.
 
     Each line is written as `<iso-timestamp> <message>`, so the timestamp is
     simply the first column. They are all UTC and all the same width, which means
     sorting the strings sorts the times -- no parsing into datetimes needed.
 
-    Interleaving matters here. Attempts overlap: a superseded worker is still
+    Interleaving matters here. Workers overlap: a superseded worker is still
     logging while its replacement boots, and reading two files side by side hides
     that. Merged and sorted, a takeover reads as one story.
 
@@ -168,8 +168,8 @@ async def read_logs(run_id: str) -> list[tuple[str, str, str]]:
         return []
 
     lines = []
-    for attempt_dir in sorted(logs_dir.iterdir()):
-        log = attempt_dir / "attempt.log"
+    for worker_dir in sorted(logs_dir.iterdir()):
+        log = worker_dir / "worker.log"
         if not log.is_file():
             continue
         last_ts = ""
@@ -181,7 +181,7 @@ async def read_logs(run_id: str) -> list[tuple[str, str, str]]:
                 last_ts = ts
             else:  # no leading timestamp: keep it next to the line it follows
                 ts, msg = last_ts, line
-            lines.append((ts, attempt_dir.name, msg))
+            lines.append((ts, worker_dir.name, msg))
 
     lines.sort(key=lambda row: (row[0], row[1]))
     return lines
@@ -252,7 +252,7 @@ def rows_html(runs: list[dict]) -> str:
         # Plain links. The browser already knows how to open a tab, and each page
         # wants its own address so it can be reloaded, shared, and left open beside
         # the dashboard.
-        logs = f"<a class='icon' href='logs/{name}' target='_blank' rel='noopener' title='Attempt logs'>{LOGS_ICON}</a>"
+        logs = f"<a class='icon' href='logs/{name}' target='_blank' rel='noopener' title='Worker logs'>{LOGS_ICON}</a>"
         ledger = (
             f"<a class='icon' href='ledger/{name}' target='_blank' rel='noopener' title='train.jsonl'>{LEDGER_ICON}</a>"
         )
@@ -370,10 +370,10 @@ setInterval(refresh, {REFRESH_MS});
 </body></html>"""
 
 
-# One colour per attempt, assigned in order of appearance. The point is not
-# decoration: when two attempts overlap, colour is what lets you see the handover
+# One colour per worker, assigned in order of appearance. The point is not
+# decoration: when two workers overlap, colour is what lets you see the handover
 # at a glance instead of comparing call ids character by character.
-ATTEMPT_COLOURS = ["#0969da", "#8250df", "#bf8700", "#1a7f37", "#cf222e", "#0f766e"]
+WORKER_COLOURS = ["#0969da", "#8250df", "#bf8700", "#1a7f37", "#cf222e", "#0f766e"]
 
 
 LOG_CSS = """
@@ -395,11 +395,11 @@ def logs_page_html(run_id: str, lines: list[tuple[str, str, str]]) -> str:
     """One run's merged log, as its own page in its own tab."""
     import html
 
-    attempts = list(dict.fromkeys(call_id for _, call_id, _ in lines))
-    colour = {c: ATTEMPT_COLOURS[i % len(ATTEMPT_COLOURS)] for i, c in enumerate(attempts)}
+    workers = list(dict.fromkeys(call_id for _, call_id, _ in lines))
+    colour = {c: WORKER_COLOURS[i % len(WORKER_COLOURS)] for i, c in enumerate(workers)}
 
     legend = " ".join(
-        f"<span class='att' style='color:{colour[c]}'>&#9679; {html.escape(c[-6:])}</span>" for c in attempts
+        f"<span class='att' style='color:{colour[c]}'>&#9679; {html.escape(c[-6:])}</span>" for c in workers
     )
 
     if lines:
@@ -411,7 +411,7 @@ def logs_page_html(run_id: str, lines: list[tuple[str, str, str]]) -> str:
             for ts, call_id, msg in lines
         )
     else:
-        body = "<div class='empty'>No attempt logs yet.</div>"
+        body = "<div class='empty'>No worker logs yet.</div>"
 
     return f"""<!doctype html>
 <html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -422,7 +422,7 @@ def logs_page_html(run_id: str, lines: list[tuple[str, str, str]]) -> str:
 <body><main>
   <header>
     <h1 class='mono'>{html.escape(run_id)}</h1>
-    <span class='muted small'>{len(lines)} lines · {len(attempts)} attempt(s)</span>
+    <span class='muted small'>{len(lines)} lines · {len(workers)} worker(s)</span>
     <span class='muted small'>· <a href='../ledger/{html.escape(run_id)}'>ledger</a>
                               · <a href='../'>all runs</a></span>
   </header>
@@ -492,7 +492,7 @@ def build_web_app():
 
     @web.get("/logs/{run_id}", response_class=HTMLResponse)
     async def logs(run_id: str):
-        """Every attempt's log for one run, merged in time order. Its own page,
+        """Every worker's log for one run, merged in time order. Its own page,
         opened in its own tab."""
         return HTMLResponse(logs_page_html(run_id, await read_logs(run_id)), headers=no_store)
 

@@ -46,7 +46,6 @@ inside the method that needs it.
 """
 
 import json
-import logging
 import time
 from datetime import datetime, UTC
 from pathlib import Path
@@ -65,9 +64,9 @@ RUNS = VOLUME / "runs"
 
 
 class Aborted(Exception):
-    """Stop this attempt, but it is not a crash -- leaving is the right answer.
+    """Stop this worker, but it is not a crash -- leaving is the right answer.
 
-    `_attempt` catches this and logs a clean exit. Anything else that escapes is
+    `work` catches this and logs a clean exit. Anything else that escapes is
     a bug and gets reported as one. Jobs raise this when handed a folder they
     cannot run.
     """
@@ -155,6 +154,7 @@ class Train:
         # A lease and a unique folder name {run_id} is everything a job gets.
         self.lease = lease
         self.run_id = run_id
+        self.log = log
         self.rdir = run_dir(run_id)
 
         self.config_dict = load_config(run_id)
@@ -424,7 +424,7 @@ class Train:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             self.step = checkpoint["step"]
             self.attempt = checkpoint["attempt"] + 1
-            logger.info(
+            self.log.info(
                 "Train: resuming %s from step %d/%d (attempt %d)",
                 self.rdir.name,
                 self.step,
@@ -436,7 +436,7 @@ class Train:
         total_norm = self.torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
         ## TODO: this syncs the GPU and CPU every step at the if level too. This is not good.
         if total_norm > max_norm:
-            logger.info(
+            self.log.info(
                 "run_training: clipped large gradients at step %d (attempt %d) -- total norm %.4f > max %.4f",
                 self.step,
                 self.attempt,
@@ -506,7 +506,7 @@ class Train:
             # swallowed. `step` is whatever was in progress when this fired,
             # not necessarily a completed/checkpointed one. Closing W&B is not
             # this method's job: `run` opened it and `run` ends it, on both paths.
-            logger.warning(
+            self.log.warning(
                 "Train: loop for %s exited before finishing, at step %d/%d (%.1f%%) -- %r",
                 self.rdir.name,
                 self.step,
@@ -565,13 +565,13 @@ class Train:
         # it can show as columns, which is exactly what config.json holds.
         self.wb = WandbRun(self.run_id, self.config_dict)
 
-        logger.info("Train: %s from step %d to %d", self.rdir.name, self.step, self.total_steps)
+        self.log.info("Train: %s from step %d to %d", self.rdir.name, self.step, self.total_steps)
         try:
             self.train()
         except BaseException:
             # Say so now rather than leaving wandb to notice a missing heartbeat
             # minutes later. Note this also fires when we were superseded, which
-            # is a clean stop -- it marks a run another attempt may already be
+            # is a clean stop -- it marks a run another worker may already be
             # training as failed.
             self.wb.fail()
             raise
@@ -656,7 +656,7 @@ class Count:
         work is up to.
         """
         step, _ = self.progress(self.rdir, self.config_dict)
-        logger.info("counting from %d to %d", step, self.total_steps)
+        self.log.info("counting from %d to %d", step, self.total_steps)
 
         while step < self.total_steps:
             step += 1

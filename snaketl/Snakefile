@@ -1,4 +1,4 @@
-"""Ingest (§3) and fit (§4), driven by config.yaml.
+"""Ingest (§3) and fit (§4), driven by data/config.yaml.
 
     sources:  one job per source -- download its urls, concatenate EOS-separated
               -> data/sources/{source_uid}/content.txt
@@ -20,6 +20,11 @@ encoder. Two splits naming the same (encoder, source) pair share one .bin.
 
 Flags come from profiles/default/config.yaml, found automatically next to this
 file. Paths are absolute, so data lands in snaketl/data/ from any directory.
+
+Two config files, and they are not the same kind of thing. profiles/default/ is
+how to run snakemake and belongs to the repo. data/config.yaml is what to build
+and belongs to the data tree it describes -- so `--config volume=X` moves it too,
+and a run against another tree reads that tree's own copy. See VOLUME below.
 """
 
 import json
@@ -31,8 +36,30 @@ from transformer.tokenizer import Tokenizer, train_bpe
 from transformer.util import download_and_concat, textfile_to_tokens_as_binary
 
 
+# Where everything lives. Defaults beside this file; `--config volume=/somewhere`
+# moves the whole tree, which is how Modal runs it -- there the Snakefile arrives
+# in a read-only image mount, so nothing may be written next to it.
+#
+# This has to be resolved before the configfile: directive below, because it is
+# what says where that file is. It can be: --config values are already in the
+# global `config` when the Snakefile is parsed, and the directive re-applies them
+# on top of whatever it loads, so `volume` survives the load intact.
+VOLUME = Path(config.get("volume", workflow.basedir))
+DATA = VOLUME / "data"
+
 # Loads config.yaml into the global `config` dict.
-configfile: str(Path(workflow.basedir) / "config.yaml")
+#
+# It lives with the data, not with the Snakefile, because it describes *this
+# tree* -- which sources it holds and how they are split -- while the Snakefile
+# only describes how to build any such tree. Keeping them apart is what lets the
+# same deployed image serve a config that changed a minute ago: edit the copy on
+# the volume and rerun, no rebuild.
+#
+# The corollary is that the file has to be there already. Snakemake raises if it
+# is missing rather than defaulting to an empty workflow, which is the behaviour
+# we want -- a silently empty `sources:` would just build nothing and call it a
+# success.
+configfile: str(DATA / "config.yaml")
 
 
 def validate(config):
@@ -61,15 +88,13 @@ def validate(config):
         assert not leaked, f"{uid}: valid sources in {s['encoder']} fit set: {sorted(leaked)}"
         for src in s["train"] + s["valid"]:
             assert src in config["sources"], f"{uid}: unknown source {src}"
-    print (config)
 
 validate(config)
 
 
-# workflow.basedir is snaketl/. download_and_concat resolves output_path against
-# `volume`, so this is what puts /data beside this Snakefile.
-VOLUME = Path(workflow.basedir)
-DATA = VOLUME / "data"
+# The rest of the tree, derived from the VOLUME/DATA pair set above the
+# configfile: directive. download_and_concat resolves output_path against
+# `volume`, which is what puts these under it.
 SOURCES = DATA / "sources"
 # Named "tokenizers" because that is where Tokenizer.from_files(uid, DATA) looks.
 TOKENIZERS = DATA / "tokenizers"
@@ -178,6 +203,7 @@ rule encode_source:
         tokenizer=str(TOKENIZERS / "{encoder_uid}" / "tokenizer.joblib"),
         encoder_config=str(TOKENIZERS / "{encoder_uid}" / "config.json"),
     output:
+        # this is where you define the wildcards so 
         str(BINS / "{encoder_uid}" / "{source_uid}.bin"),
     run:
         # DATA is the volume here: from_files looks under DATA/tokenizers, and
