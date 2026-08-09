@@ -73,7 +73,7 @@ async def scan() -> list[dict]:
     """One row per run folder, newest first.
 
     Reloads the volume first: this container is long-lived, so its snapshot is
-    stale by default -- the same reason `launch` and `Worker` reload.
+    stale by default -- the same reason `launch` and `work` reload.
 
     Liveness is asked only about runs that are not finished, and all of those
     questions go out together, so the page costs one round-trip rather than one

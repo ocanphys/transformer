@@ -1,12 +1,10 @@
 import json
-import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from datetime import datetime, UTC
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
 RUNS = Path("/storage/runs")  # volume mount path, as seen inside the containers
 
 
@@ -75,10 +73,16 @@ class Job(ABC):
     place this class opens the lease; see `Count` for one way to do it.
     """
 
-    def __init__(self, lease, run_id: str):
-        # A lease and a folder is everything a job gets. No Worker, so no route to
-        # identity, logging, or the Dict; the one useful fact -- which call is
+    def __init__(self, lease, run_id: str, log):
+        # A lease, a folder, and a voice is everything a job gets. No route to the
+        # worker's identity or the Dict; the one useful fact -- which call is
         # writing -- rides along on the lease.
+        #
+        # `log` is the worker's own logger, named for its call id, and it is
+        # handed over rather than fetched because that name is what decides where
+        # a line lands. A module-level `getLogger(__name__)` here would be one
+        # logger shared by every call the container ever serves, which is the
+        # thing this design exists to rule out.
         #
         # The config read is shared because the failure is shared: a folder whose
         # config.json is gone is one no job can run, and leaving it alone is
@@ -87,6 +91,7 @@ class Job(ABC):
         # which keys it needs, and how to validate them, is `configure`.
         self.lease = lease
         self.run_id = run_id
+        self.log = log
         self.rdir = run_dir(run_id)
         self.config_dict = load_config(run_id)
         if self.config_dict is None:
@@ -189,7 +194,7 @@ class Job(ABC):
         with self.lease(label, commit=True):
             write()
             self.flush_pending()
-            logger.info("%s: %s", type(self).__name__, label)
+            self.log.info("%s: %s", type(self).__name__, label)
 
     def configure(self, config: dict) -> None:
         """Pull out and validate the keys this job needs, and set up per-job state.
@@ -502,7 +507,7 @@ class Train(Job):
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             self.step = checkpoint["step"]
             self.attempt = checkpoint["attempt"] + 1
-            logger.info(
+            self.log.info(
                 "Train: resuming %s from step %d/%d (attempt %d)",
                 self.rdir.name,
                 self.step,
@@ -514,7 +519,7 @@ class Train(Job):
         total_norm = self.torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
         ## TODO: this syncs the GPU and CPU every step at the if level too. This is not good.
         if total_norm > max_norm:
-            logger.info(
+            self.log.info(
                 "run_training: clipped large gradients at step %d (attempt %d) -- total norm %.4f > max %.4f",
                 self.step,
                 self.attempt,
@@ -565,7 +570,7 @@ class Train(Job):
             # swallowed. `step` is whatever was in progress when this fired,
             # not necessarily a completed/checkpointed one. Closing W&B is not
             # this method's job: `run` opened it and `run` ends it, on both paths.
-            logger.warning(
+            self.log.warning(
                 "Train: loop for %s exited before finishing, at step %d/%d (%.1f%%) -- %r",
                 self.rdir.name,
                 self.step,
@@ -681,7 +686,7 @@ class Train(Job):
         # it can show as columns, which is exactly what config.json holds.
         self.wb = WandbRun(self.run_id, self.config_dict)
 
-        logger.info("Train: %s from step %d to %d", self.rdir.name, self.step, self.total_steps)
+        self.log.info("Train: %s from step %d to %d", self.rdir.name, self.step, self.total_steps)
         try:
             self.train()
         except BaseException:
@@ -762,7 +767,7 @@ class Count(Job):
         work is up to.
         """
         step, _ = self.progress(self.rdir, self.config_dict)
-        logger.info("counting from %d to %d", step, self.total_steps)
+        self.log.info("counting from %d to %d", step, self.total_steps)
 
         while step < self.total_steps:
             step += 1
