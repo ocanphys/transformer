@@ -50,8 +50,6 @@ import time
 from datetime import datetime, UTC
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
 # The volume mount, as seen inside the containers, and the three trees on it. A
 # config's train_path/valid_path are relative to VOLUME, not to a run folder --
 # the same convention transformer.util.run_training reads them under, so one

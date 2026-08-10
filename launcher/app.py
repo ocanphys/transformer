@@ -15,8 +15,8 @@ The parts:
     launch    start or resume a run; safe to call repeatedly. Spawns workers.
     work      one worker -- one container, one call id, one go at one run.
     JOB       what this deployment runs; the toy counter stands in for training.
-    etl       runs the snaketl workflow to build the data a run trains on. No
-              lease: a DAG of file targets is already idempotent.
+    etl       runs the notebooks/pipeline workflow to build the data a run trains
+              on. No lease: a DAG of file targets is already idempotent.
 
 Logging lives in logs.py -- a logger named for the call id, handlers answering to
 that name only, so a handler outliving its call cannot write into the next run.
@@ -33,12 +33,12 @@ Usage:
     modal deploy launcher/app.py                       # deploy (do this first)
     modal run launcher/app.py --name alpha             # start a run
     modal run launcher/app.py --run-id 2026...._alpha  # resume it
-    modal run launcher/app.py::prepare --targets main  # build the data for one split
+    modal run launcher/app.py::prepare --run-id 2026....  # build that run's data
 """
 
 import json
+import re
 import subprocess
-import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -58,11 +58,12 @@ APP_NAME = "training-launcher"
 VOLUME_NAME = "test-volume"  # flip to "LLM-pretraining" once the real trainer is wired in
 DICT_NAME = "training-leases"
 
-# Where the snaketl workflow lives on each side. PROJECT_ROOT comes from __file__,
-# not config.py: only launcher/ is on the path in a container, and this is read
-# while describing the image, never inside one.
+# Where the pipeline lives on each side. PROJECT_ROOT comes from __file__, not
+# config.py: only launcher/ is on the path in a container, and this is read while
+# describing the image, never inside one.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SNAKETL = "/snaketl"  # the workflow definition, read-only, shipped with the image
+PIPELINE_DIR = PROJECT_ROOT / "notebooks" / "pipeline"  # the Snakefile and its modules, locally
+PIPELINE = "/pipeline"  # the same folder in the image, read-only
 STORAGE = "/storage"  # the Volume: where the workflow's artifacts and its metadata land
 
 LEASE_RETRIES = 5  # how many times an indeterminate lease read is worth re-asking
@@ -89,14 +90,15 @@ web_image = base_image.pip_install("fastapi[standard]").add_local_python_source(
 # The ETL needs the real project environment: uv_sync installs the lockfile's deps
 # (snakemake, joblib, ...) and `transformer` rides along because the Snakefile
 # imports it. The Snakefile and its profile come as a plain directory since
-# add_local_python_source only ships importable modules. data/ and .snakemake/ are
-# excluded -- they are the workflow's output, built on the Volume, and a laptop's
-# copy would plant stale artifacts snakemake would trust.
+# add_local_python_source only ships importable modules. data/, runs/ and
+# .snakemake/ are excluded -- they are the workflow's output and its requests,
+# which live on the Volume, and a laptop's copy would plant a stale spec and stale
+# artifacts snakemake would trust.
 etl_image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_sync(uv_project_dir=PROJECT_ROOT)
     .add_local_python_source(*LOCAL_MODULES, "transformer")
-    .add_local_dir(PROJECT_ROOT / "snaketl", SNAKETL, ignore=["data", ".snakemake", "**/__pycache__"])
+    .add_local_dir(PIPELINE_DIR, PIPELINE, ignore=["data", "runs", ".snakemake", "**/__pycache__"])
 )
 
 # --------------------------------------------------------------------------------------
@@ -455,18 +457,18 @@ def dashboard():
 
 
 # --------------------------------------------------------------------------------------
-# the ETL: the snaketl workflow, run against the Volume
+# the ETL: the pipeline workflow, run against the Volume
 # --------------------------------------------------------------------------------------
 
 
 @app.function(image=etl_image, volumes={STORAGE: volume}, cpu=4, timeout=3600, max_containers=1)
-def etl(targets: list[str] | None = None, flags: list[str] | None = None, unlock: bool = False) -> dict:
-    """Run `snakemake` in a container, with the Volume as its data directory.
+def etl(run_id: str) -> dict:
+    """Build what one run needs, with the Volume as snakemake's data directory.
 
-    Same targets and flags as the local command -- `etl(["main"], ["-n"])` is
-    `snakemake main -n` -- because this shells out to the real snakemake rather
-    than reimplementing any part of it. Two arguments are supplied here and are
-    not yours to pass:
+    `run_id` is the same key `launch` uses -- one run, one folder, one primary
+    key from ETL through training. One hardcoded command, shelling out to the real
+    snakemake rather than reimplementing any part of it. Three of its arguments
+    are the interesting ones:
 
         --directory /storage   the working directory, so .snakemake/ (the metadata
                                that decides what needs rebuilding) survives the
@@ -474,53 +476,55 @@ def etl(targets: list[str] | None = None, flags: list[str] | None = None, unlock
         --config volume=...    where artifacts go. The Snakefile defaults this to
                                its own folder, which here is a read-only image
                                mount, so it has to be redirected at the Volume.
+        --config run_id=...    whose request to build. The Snakefile has no default
+                               for it: guessing would build another run's spec.
 
-    Those two are the whole reason a container can do incremental builds at all:
-    with either one missing, every invocation starts from an empty tree and
+    The first two are the whole reason a container can do incremental builds at
+    all: with either one missing, every invocation starts from an empty tree and
     rebuilds the world.
 
-    What to build is read from the Volume too -- /storage/data/config.yaml, which
-    the Snakefile locates from that same `volume` value. It is not in the image,
-    so changing which sources exist is an upload rather than a redeploy:
+    What to build is read from the Volume too -- /storage/runs/{run_id}/run.yaml,
+    which the Snakefile locates from those same two values. It is not in the
+    image, so changing what a run asks for is an upload rather than a redeploy:
 
-        modal volume put test-volume snaketl/data/config.yaml /data/config.yaml --force
+        modal volume put test-volume run.yaml /runs/{run_id}/run.yaml --force
 
-    and it has to be there before the first call, or snakemake raises on the
-    missing configfile.
+    and it has to be there before the call, or snakemake raises on the missing
+    file. Artifacts land under /storage/data/, addressed by uid and shared with
+    every other run -- asking for an encoder another run already fit costs
+    nothing.
 
     No lease, unlike `work`. This is a different shape of job -- a DAG that is
     idempotent by construction, where a crashed run leaves finished outputs in
     place and re-running resumes from them. What it does need is to not race
     itself, and `max_containers=1` gives that the same way it does for `launch`.
-    Snakemake's own directory lock is the backstop, and it is why `unlock` exists:
-    a container killed mid-run (a cancel, a timeout) leaves that lock behind on
-    the Volume, and the next call refuses to start until someone clears it.
+    Snakemake's own directory lock is the backstop: a container killed mid-run (a
+    cancel, a timeout) leaves that lock behind on the Volume, and the next call
+    refuses to start until someone clears it -- which right now means adding
+    --unlock to the command below and redeploying.
     """
+    # run_id is the one thing interpolated into a shell command below, and it also
+    # becomes a path segment. Both reasons to insist it is a bare name -- which
+    # every id `mint_run_id` produces already is.
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", run_id), f"run_id {run_id!r} is not a bare name"
+
     volume.reload()  # containers are reused; start from what previous runs committed
 
-    # Targets go first, before any option. `--config` takes a variable-length list
-    # of key=value pairs, so anything non-dash that follows it is swallowed as
-    # another pair -- a trailing target becomes `Invalid config definition`. Ending
-    # the line with --config, and putting the only positional arguments up front,
-    # is what keeps that from depending on whether `flags` happens to be empty.
-    argv = [
-        sys.executable,
-        "-m",
-        "snakemake",
-        *(targets or []),
-        "--snakefile",
-        f"{SNAKETL}/Snakefile",
-        "--directory",
-        STORAGE,
-        "--workflow-profile",
-        f"{SNAKETL}/profiles/default",
-        *(["--unlock"] if unlock else []),
-        *(flags or []),
-        "--config",
-        f"volume={STORAGE}",
-    ]
-    print(f"$ {' '.join(argv)}")
-    result = subprocess.run(argv)
+    # The target goes first, before any option: `--config` takes a variable-length
+    # list of key=value pairs, so a target after it would be swallowed as another
+    # pair and rejected as `Invalid config definition`.
+    command = (
+        "snakemake all"
+        f" --snakefile {PIPELINE}/Snakefile"
+        f" --directory {STORAGE}"
+        f" --workflow-profile {PIPELINE}/profiles/default"
+        f" --config volume={STORAGE} run_id={run_id}"
+    )
+    print(f"$ {command}")
+
+    # shell=True so what runs is exactly the line printed above. Bare `snakemake`
+    # resolves because uv_sync puts its venv's bin on PATH.
+    result = subprocess.run(command, shell=True)
 
     # Commit either way. A failed workflow still finished some of its jobs, and
     # those outputs plus the metadata describing them are exactly what makes the
@@ -531,7 +535,7 @@ def etl(targets: list[str] | None = None, flags: list[str] | None = None, unlock
 
     if result.returncode:
         raise RuntimeError(f"snakemake exited {result.returncode}")
-    return {"targets": targets or ["all"], "returncode": result.returncode}
+    return {"run_id": run_id, "target": "all", "returncode": result.returncode}
 
 
 # --------------------------------------------------------------------------------------
@@ -558,22 +562,17 @@ def main(run_id: str = "", name: str = "run", total_steps: int = 20, save_every:
 
 
 @app.local_entrypoint()
-def prepare(targets: str = "", flags: str = "", unlock: bool = False):
-    """Run the snaketl workflow on Modal.
+def prepare(run_id: str):
+    """Build the data one run needs, on Modal.
 
-        modal run launcher/app.py::prepare                          # everything
-        modal run launcher/app.py::prepare --targets "main split"   # named targets
-        modal run launcher/app.py::prepare --flags "-n"             # dry run
-        modal run launcher/app.py::prepare --unlock                 # clear a stale lock
+        modal run launcher/app.py::prepare --run-id 2026...._alpha
 
-    Targets and flags arrive as one string each and are split on whitespace,
-    because a `modal run` entrypoint only takes scalars. That rules out any
-    argument containing a space -- none of ours do, and the alternative is
-    quoting rules nobody wants to learn for a wrapper this thin.
+    The same run_id `main` starts a run under: its request is read from
+    /storage/runs/{run_id}/run.yaml, which has to be on the Volume first.
 
     Unlike `main`, this calls `etl.remote` on the local app rather than reaching
     for the deployed one. `main` needs `Function.from_name` because `launch`'s
     single-container lock only means anything within one deployment; the workflow
     has no such lock to protect, so running it from here is the same job.
     """
-    print(etl.remote(targets=targets.split(), flags=flags.split(), unlock=unlock))
+    print(etl.remote(run_id=run_id))

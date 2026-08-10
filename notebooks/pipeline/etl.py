@@ -1,0 +1,150 @@
+"""What one training run needs built, and where it lands.
+
+Imported by both ends: the notebook writes runs/{run_id}/run.yaml with these
+functions and the Snakefile reads it back with them, so the layout and the
+encoder's address are defined once.
+
+    <workflow>/sources.yaml                   the catalog: uid -> urls, tags
+    {volume}/runs/{run_id}/run.yaml           one run's request
+
+A run's request is per-run; what it builds is not. Artifacts are addressed by
+content (source uid, encoder uid), so two runs asking for the same encoder share
+its bins instead of each building a copy -- which is why data/ sits beside runs/
+rather than inside one.
+
+Layout under data/ (everything but sources/ is derived and safe to rm -rf):
+
+    sources/{source_uid}/content.txt          raw text, EOS-separated
+    encoders/{encoder_uid}/encoder.joblib     the fitted encoder
+    encoders/{encoder_uid}/config.json        what it was fit from
+    encoders/{encoder_uid}/{source_uid}.bin   that source, encoded by it
+"""
+
+import hashlib
+import json
+from pathlib import Path
+
+import yaml
+
+# The catalog, beside the Snakefile: about the pipeline, not about one tree.
+CATALOG_FILE = "sources.yaml"
+# One run's request, generated, in that run's folder.
+RUN_FILE = "run.yaml"
+# Where run folders live under a volume. launcher/jobs.py names the same folder
+# from the other side, where the volume is always /storage.
+RUNS_DIR = "runs"
+
+
+def encoder_uid(encoder: dict) -> str:
+    """Content address of an encoder: {kind}-{first 8 hex of sha256}.
+
+    The payload is spelled out field by field so a key that does not change the
+    artifact cannot change its address -- including encoder_uid itself, which
+    validate() re-derives from a spec that already carries one. fit_sources is
+    sorted because their order does not affect the fit; params is not, because
+    special_tokens is a list whose order sets the token ids.
+    """
+    payload = {
+        "kind": encoder["kind"],
+        "params": encoder["params"],
+        "fit_sources": sorted(encoder["fit_sources"]),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return f"{encoder['kind']}-{digest[:8]}"
+
+
+def spec(config: dict) -> dict:
+    """A training config's `encoder` and `sources` blocks, verbatim, plus the
+    encoder's derived address. Verbatim so there is no second vocabulary to keep
+    in sync and `params` can carry whatever a kind needs."""
+    return {
+        "encoder": {**config["encoder"], "encoder_uid": encoder_uid(config["encoder"])},
+        "sources": config["sources"],
+    }
+
+
+def validate(spec: dict, catalog: dict) -> None:
+    """Reject a request the DAG would happily build the wrong thing from.
+
+    The overlap rules are policy: an encoder that saw a validation source has the
+    holdout in its merge table, and a validation loss measured against training
+    text measures nothing.
+    """
+    encoder = spec["encoder"]
+    train = spec["sources"]["train_sources"]
+    valid = spec["sources"]["valid_sources"]
+    fit = encoder["fit_sources"]
+
+    assert train, "no train_sources"
+    assert valid, "no valid_sources"
+    assert fit, "encoder has no fit_sources"
+
+    unknown = sorted((set(fit) | set(train) | set(valid)) - set(catalog))
+    assert not unknown, f"not in the source catalog ({CATALOG_FILE}): {unknown}"
+
+    # Named, because with several sources a side "there is an overlap" leaves you
+    # diffing lists by eye.
+    overlap = sorted(set(train) & set(valid))
+    assert not overlap, f"train/valid overlap: {overlap}"
+    leaked = sorted(set(valid) & set(fit))
+    assert not leaked, f"valid sources in the encoder's fit set: {leaked}"
+
+    # A uid that no longer matches its definition means a hand-edited run.yaml.
+    expected = encoder_uid(encoder)
+    assert encoder["encoder_uid"] == expected, (
+        f"encoder_uid {encoder['encoder_uid']} does not match this definition ({expected})"
+    )
+
+
+def read_catalog(workflow_dir: Path) -> dict:
+    """The catalog's sources, uid -> {urls, tags}. workflow_dir holds the
+    Snakefile, this module and sources.yaml, and is passed rather than derived
+    from __file__ so the caller says which pipeline it means."""
+    return yaml.safe_load((Path(workflow_dir) / CATALOG_FILE).read_text())["sources"]
+
+
+def run_dir(volume: Path, run_id: str) -> Path:
+    """One run's folder: where its request lives and where the trainer writes.
+    Both halves of a run_id's folder are named here, so the launcher and this
+    pipeline cannot disagree about where a request was left."""
+    return Path(volume) / RUNS_DIR / run_id
+
+
+def write_spec(spec: dict, rdir: Path) -> Path:
+    """Write run.yaml into the run's own folder -- the half a run_id selects, so a
+    deployed image serves a request edited a minute ago."""
+    path = Path(rdir) / RUN_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = f"# generated by etl_train_pipeline.ipynb via {Path(__file__).name} -- do not edit\n"
+    path.write_text(header + yaml.safe_dump(spec, sort_keys=False))
+    return path
+
+
+def read_spec(rdir: Path) -> dict:
+    """Read run.yaml back. Missing is an error, not an empty workflow: a run that
+    builds nothing and reports success is the worse failure."""
+    path = Path(rdir) / RUN_FILE
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found -- run the ETL cell of etl_train_pipeline.ipynb first")
+    return yaml.safe_load(path.read_text())
+
+
+def source_content(data: Path, source_uid: str) -> Path:
+    return Path(data) / "sources" / source_uid / "content.txt"
+
+
+def encoder_dir(data: Path, encoder_uid: str) -> Path:
+    return Path(data) / "encoders" / encoder_uid
+
+
+def encoder_artifact(data: Path, encoder_uid: str) -> Path:
+    return encoder_dir(data, encoder_uid) / "encoder.joblib"
+
+
+def encoder_config(data: Path, encoder_uid: str) -> Path:
+    return encoder_dir(data, encoder_uid) / "config.json"
+
+
+def encoded_bin(data: Path, encoder_uid: str, source_uid: str) -> Path:
+    """encoded sources live under the encoder that encoded them"""
+    return encoder_dir(data, encoder_uid) / f"{source_uid}.bin"

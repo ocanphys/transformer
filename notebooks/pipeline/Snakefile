@@ -1,0 +1,220 @@
+"""Build the data one training run needs, as defined in etl_train_pipeline.ipynb.
+
+    sources.yaml urls -> sources/{source_uid}/content.txt
+                               |  fit_sources          |  train + valid
+                               v                       v
+         encoders/{encoder_uid}/encoder.joblib -> encoders/{encoder_uid}/{source_uid}.bin
+
+Nothing here names an encoder or a split: the DAG is derived from run.yaml, so
+asking for a bin fits the encoder and fitting it downloads the sources it needs.
+
+Every command needs `--config run_id=<run_id>` -- which request to build -- left
+off here for width:
+
+    snakemake              # this run's bins
+    snakemake encoder      # just fit the encoder
+    snakemake train        # just one side of the split
+    snakemake odyssey      # just fetch one source, by catalog uid
+    snakemake -n           # dry run
+
+What reacts to what:
+
+  - a source is never checked, only required -- content.txt is ancient() wherever
+    it is consumed, so editing one changes nothing until something missing needs
+    it, and a source can even be deleted while its bins stay valid.
+  - a deleted bin is re-encoded on its own, with the encoder already on disk. No
+    refit, and its siblings are not touched.
+  - a deleted or refit encoder takes its bins with it: they are only meaningful
+    relative to the merge table that produced them, so all of them are
+    re-encoded. (A refit that comes out byte-identical is free -- the bins are
+    then already correct and snakemake leaves them alone.)
+
+encoder_uid is a hash of the encoder's definition (etl.encoder_uid), so the
+directory a bin sits in identifies what encoded it.
+
+Two config files at two levels: sources.yaml beside this file is the catalog of
+what a uid means, runs/{run_id}/run.yaml in the tree is what one run wants. So
+`--config volume=X run_id=Y` picks the tree and the request within it, and the
+catalog stays with the workflow. Flags come from profiles/default/config.yaml,
+found next to this file.
+
+Encoder kinds live in encoders.py -- nothing here knows what a bpe is.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+from transformer.util import download_and_concat
+
+# etl.py and encoders.py sit next to this file; snakemake does not put the
+# workflow directory on sys.path.
+sys.path.insert(0, workflow.basedir)
+import encoders
+import etl
+
+
+# The workflow: this file, its two modules, sources.yaml, profiles/.
+WORKFLOW = Path(workflow.basedir)
+
+# Where the data lives. `--config volume=/somewhere` moves the tree, which is how
+# Modal runs it -- there this file is a read-only mount.
+VOLUME = Path(config.get("volume", workflow.basedir))
+
+# Artifacts are addressed by uid, so they are shared by every run rather than
+# built per run: data/ sits beside runs/, not inside one.
+DATA = VOLUME / "data"
+
+# Which run to build. Required, and deliberately not defaulted: every request
+# lives in its own folder, so guessing one would build somebody else's run.
+assert "run_id" in config, "pass --config run_id=<run_id>: whose run.yaml to build"
+RUN_ID = config["run_id"]
+
+# The catalog, into the global `config`. From WORKFLOW, not DATA, so an empty
+# volume still knows what a source uid means.
+configfile: str(WORKFLOW / etl.CATALOG_FILE)
+
+# uid -> {urls, tags}: what exists, not what this run wants.
+CATALOG = config["sources"]
+
+# The request, read with plain yaml -- its `sources` key would collide with the
+# catalog's in the one flat `config` dict.
+RUN = etl.read_spec(etl.run_dir(VOLUME, RUN_ID))
+etl.validate(RUN, CATALOG)
+
+ENCODER = RUN["encoder"]
+UID = ENCODER["encoder_uid"]
+TRAIN = RUN["sources"]["train_sources"]
+VALID = RUN["sources"]["valid_sources"]
+
+# Every catalog uid becomes a rule name below, so one of these would shadow a target.
+shadowed = sorted({"all", "encoder", "train", "valid"} & set(CATALOG))
+assert not shadowed, f"source uid shadows a workflow target: {shadowed}"
+
+# Sources are joined by EOS, not a newline, so the encoder sees a boundary.
+EOS = "\n<|endoftext|>\n"
+
+# Both wildcards are one path segment, or {source_uid} would match "a/b".
+wildcard_constraints:
+    source_uid=r"[^/]+",
+    encoder_uid=r"[^/]+",
+
+
+def encoder_definition(encoder_uid: str) -> dict:
+    """The definition behind an address, for fitting it.
+
+    Only this run's encoder has one -- a uid is a hash and cannot be turned back
+    into a config. For encoders already on disk, config.json is that record.
+    """
+    if encoder_uid != UID:
+        raise ValueError(
+            f"{encoder_uid} is not this run's encoder ({UID}), so it cannot be fit here; "
+            f"its definition is in its own config.json"
+        )
+    return ENCODER
+
+
+def run_bins(source_uids) -> list[str]:
+    """This run's bins for these sources; deduplicated, since one path is one file."""
+    return [str(etl.encoded_bin(DATA, UID, uid)) for uid in dict.fromkeys(source_uids)]
+
+
+# Default target: this run's bins pull in everything above them in the diagram.
+# The encoder is asked for by name as well, because the bins do not ask for it
+# once they exist -- without this a deleted encoder is never noticed.
+rule all:
+    input:
+        str(etl.encoder_artifact(DATA, UID)),
+        str(etl.encoder_config(DATA, UID)),
+        run_bins(TRAIN + VALID),
+
+
+# Fetch one source. No file inputs -- its raw material is the catalog, so this is
+# a leaf: once content.txt exists it is done, and editing its urls refetches it.
+rule write_content:
+    output:
+        # create the raw source artifact.
+        str(etl.source_content(DATA, "{source_uid}")),
+    params:
+        # redownloaded if url changes.
+        # A param, not a config read inside run:, so snakemake sees url edits.
+        urls=lambda wildcards: CATALOG[wildcards.source_uid]["urls"],
+    retries: 3
+    run:
+        download_and_concat(
+            urls=params.urls,
+            output_path=str(Path(output[0]).relative_to(VOLUME)),
+            volume=VOLUME,
+            separator=EOS,
+        )
+
+
+# Fit the encoder on its fit_sources, downloading any that are missing.
+rule fit_encoder:
+    input:
+        # ancient - once the encoder is fitted on the source - it stops
+        # looking backwards in case the sources are modified.
+        # this is for maintaining downstream consistency. Without this if 
+        # source we fit the encoder on changes then encoder will be refit
+        # and bins already created will be stale wrt to the encoder
+        lambda wildcards: [
+            ancient(str(etl.source_content(DATA, uid)))
+            for uid in encoder_definition(wildcards.encoder_uid)["fit_sources"]
+        ],
+    output:
+        # this creates the .joblib file (encoder artifact) and the config.json
+        # by fitting the encoder on the sources specified in the input.
+        # once they are created they can not be modified.
+        encoder=str(etl.encoder_artifact(DATA, "{encoder_uid}")),
+        config=str(etl.encoder_config(DATA, "{encoder_uid}")),
+    params:
+        definition=lambda wildcards: encoder_definition(wildcards.encoder_uid),
+    run:
+        encoders.fit(params.definition, list(input), output.encoder)
+        Path(output.config).write_text(json.dumps(params.definition, indent=2))
+
+
+# Encode one source with one encoder: one job per (encoder, source) pair.
+rule encode_source:
+    input:
+        # once 
+        # ancient() throughout: an existing bin is never re-encoded, whether its
+        # source changed or the encoder beside it did.
+        text=ancient(str(etl.source_content(DATA, "{source_uid}"))),
+        encoder=str(etl.encoder_artifact(DATA, "{encoder_uid}")),
+        config=str(etl.encoder_config(DATA, "{encoder_uid}")),
+    output:
+        str(etl.encoded_bin(DATA, "{encoder_uid}", "{source_uid}")),
+    run:
+        # From the encoder's own config.json, so bins under an older encoder build.
+        encoders.encode(
+            definition=json.loads(Path(input.config).read_text()),
+            artifact=input.encoder,
+            source=input.text,
+            target=output[0],
+        )
+
+
+# `snakemake encoder` / `snakemake train` / `snakemake odyssey`: empty rules
+# asking for artifacts, which the rules above are what match.
+rule encoder:
+    input:
+        str(etl.encoder_artifact(DATA, UID)),
+
+
+rule train:
+    input:
+        run_bins(TRAIN),
+
+
+rule valid:
+    input:
+        run_bins(VALID),
+
+
+for uid in CATALOG:
+    rule:
+        name:
+            str(f"{uid}")
+        input:
+            str(etl.source_content(DATA, uid)),
