@@ -12,11 +12,17 @@ Each system does only what it is good at:
 
 The parts:
 
-    launch    start or resume a run; safe to call repeatedly. Spawns workers.
+    launch    start or resume a run; safe to call repeatedly. Builds the run's data,
+              then spawns workers.
     work      one worker -- one container, one call id, one go at one run.
-    JOB       what this deployment runs; the toy counter stands in for training.
+    JOB       what this deployment runs; Train, on the data the ETL built.
     etl       runs the notebooks/pipeline workflow to build the data a run trains
               on. No lease: a DAG of file targets is already idempotent.
+
+A run is one folder and one file: runs/{run_id}/config.json, written once at
+creation from the config dict in etl_train_pipeline.ipynb. Everything else in the
+folder is derived -- the request the ETL resolved, the data it gathered, the
+checkpoints the worker wrote.
 
 Logging lives in logs.py -- a logger named for the call id, handlers answering to
 that name only, so a handler outliving its call cannot write into the next run.
@@ -30,15 +36,18 @@ Simplifications, each explained where it happens: no config hash, no checkpoint
 pruning, no audit copy of each grant, one retry policy for every lease check.
 
 Usage:
-    modal deploy launcher/app.py                       # deploy (do this first)
-    modal run launcher/app.py --name alpha             # start a run
-    modal run launcher/app.py --run-id 2026...._alpha  # resume it
-    modal run launcher/app.py::prepare --run-id 2026....  # build that run's data
+    modal deploy launcher/app.py                          # deploy (do this first)
+    etl_train_pipeline.ipynb                              # start a run: it owns the config
+    modal run launcher/app.py --run-id 2026...._alpha     # resume it
+    modal run launcher/app.py::prepare --run-id 2026....  # rebuild that run's data
 """
 
 import json
+import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -48,18 +57,18 @@ from modal.exception import Error, FunctionTimeoutError, OutputExpiredError
 
 # Jobs and the shared run-folder layout live in jobs.py. The dependency runs one
 # way (app -> jobs), so there is no cycle and Aborted has a single definition.
-from jobs import Aborted, Count, mint_run_id, load_config, run_dir
+from jobs import Aborted, Train, encoder_record, mint_run_id, load_config, run_dir, split_bin
 
 # Logging lives in logs.py: a logger named for this call, and handlers that
-# answer to that name only. A worker takes one and passes it on.
-from logs import release_worker_logger, worker_logger
+# answer to that name only. `work` and `etl` each take one and pass it on.
+from logs import call_logger, release_call_logger
 
 APP_NAME = "training-launcher"
 VOLUME_NAME = "test-volume"  # flip to "LLM-pretraining" once the real trainer is wired in
 DICT_NAME = "training-leases"
 
 # Where the pipeline lives on each side. PROJECT_ROOT comes from __file__, not
-# config.py: only launcher/ is on the path in a container, and this is read while
+# config.py: only launcher/ is on fthe path in a container, and this is read while
 # describing the image, never inside one.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PIPELINE_DIR = PROJECT_ROOT / "notebooks" / "pipeline"  # the Snakefile and its modules, locally
@@ -68,6 +77,11 @@ STORAGE = "/storage"  # the Volume: where the workflow's artifacts and its metad
 
 LEASE_RETRIES = 5  # how many times an indeterminate lease read is worth re-asking
 LEASE_BACKOFF = 5.0  # seconds x try number -> 5, 10, 15, 20: ~50s of patience in total
+
+# What `work` trains on. Must be a GPU the configs' model_params.device asks for:
+# set this to None and device to "cpu" in the config to exercise the wiring without
+# paying for one -- both have to change together or torch raises at construction.
+GPU = "T4"
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -85,7 +99,15 @@ LOCAL_MODULES = ("jobs", "logs")
 image = base_image.add_local_python_source(*LOCAL_MODULES)
 
 # The dashboard needs a web server, and its own module shipped alongside this one.
-web_image = base_image.pip_install("fastapi[standard]").add_local_python_source(*LOCAL_MODULES, "dashboard")
+# applog rides along because the sessions view reads the file format that module
+# defines -- reading it needs none of its Modal machinery, only its parser.
+web_image = base_image.pip_install("fastapi[standard]").add_local_python_source(
+    *LOCAL_MODULES, "applog", "dashboard"
+)
+
+# The collector needs nothing a Modal container does not already have: the client
+# library is injected into every one of them, and everything it calls is in there.
+collector_image = base_image.add_local_python_source(*LOCAL_MODULES, "applog")
 
 # The ETL needs the real project environment: uv_sync installs the lockfile's deps
 # (snakemake, joblib, ...) and `transformer` rides along because the Snakefile
@@ -99,6 +121,15 @@ etl_image = (
     .uv_sync(uv_project_dir=PROJECT_ROOT)
     .add_local_python_source(*LOCAL_MODULES, "transformer")
     .add_local_dir(PIPELINE_DIR, PIPELINE, ignore=["data", "runs", ".snakemake", "**/__pycache__"])
+)
+
+# The trainer needs the same project environment as the ETL, minus the pipeline
+# directory -- it reads its data out of the run folder, not out of the workflow --
+# plus wandb_run, which `Train.run` imports lazily.
+train_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_sync(uv_project_dir=PROJECT_ROOT)
+    .add_local_python_source(*LOCAL_MODULES, "wandb_run", "transformer")
 )
 
 # --------------------------------------------------------------------------------------
@@ -220,6 +251,18 @@ async def launch(run_id: str | None = None, name: str = "run", config: dict | No
         (run_dir(run_id) / "config.json").write_text(json.dumps(config or {}, indent=2))
         await volume.commit.aio()
 
+        # The data this config asks for, before anyone trains on it. Committed first,
+        # because the ETL reads that config.json from its own mount.
+        #
+        # Blocking, and inside the lock: a first build of a new encoder holds this
+        # container for as long as it takes, and every other launch waits. What makes
+        # that affordable is that it is the only time it happens -- artifacts are
+        # addressed by uid, so a config asking for anything already built comes back
+        # in seconds with "Nothing to be done". Creation only: config.json is written
+        # once, so a resume's request cannot have changed, and a bin that went missing
+        # under one is a real error the worker should report rather than paper over.
+        await etl.remote.aio(run_id)
+
         call = await work.spawn.aio(run_id)
         granted = await leases.put.aio(
             lease_key(run_id), {"call_id": call.object_id, "granted_ts": time.time(), "attempt": 1}, skip_if_exists=True
@@ -234,7 +277,7 @@ async def launch(run_id: str | None = None, name: str = "run", config: dict | No
     # L7 -- a run whose definition is gone gets quarantined, never guessed at.
     config = load_config(run_id)
     if config is None:
-        return {"run_id": run_id, "reason": "no readable config.json -- orphaned", "call_id": None}
+        return {"run_id": run_id, "reason": "unreadable -- no config.json to run under", "call_id": None}
 
     # L3 -- finished? The job decides from committed files alone. A finished run
     # must read as finished forever, and Modal forgets old call outcomes, so ask
@@ -243,7 +286,7 @@ async def launch(run_id: str | None = None, name: str = "run", config: dict | No
     try:
         done, total = JOB.progress(run_dir(run_id), config)
     except Aborted as e:
-        return {"run_id": run_id, "reason": f"{e} -- orphaned", "call_id": None}
+        return {"run_id": run_id, "reason": f"unreadable -- {e}", "call_id": None}
     if done >= total:
         return {"run_id": run_id, "reason": "already complete", "call_id": None}
 
@@ -266,6 +309,7 @@ async def launch(run_id: str | None = None, name: str = "run", config: dict | No
     # An ordinal, not an entity: attempt 2 *at* the run. The worker making it is
     # named by call id; only the count lives here.
     attempt = (grant["attempt"] + 1) if grant else 1
+    await etl.remote.aio(run_id)
     call = await work.spawn.aio(run_id)
     await leases.put.aio(
         lease_key(run_id),
@@ -360,7 +404,15 @@ class Lease:
             volume.commit()
 
 
-@app.function(image=image, volumes={"/storage": volume}, timeout=3600, retries=0)
+@app.function(
+    image=train_image,
+    volumes={"/storage": volume},
+    gpu=GPU,
+    secrets=[modal.Secret.from_name("wandb-secret")],
+    timeout=3600,
+    retries=0,
+    single_use_containers=True,
+)
 def work(run_id: str) -> dict:
     """One worker: prove ownership, hand the lease to the job, record why we stopped.
 
@@ -380,14 +432,32 @@ def work(run_id: str) -> dict:
 
     The log capture sits inside that wrapper, so a crash is written to the run's
     own file -- while the handler is still attached -- before the failure is
-    reworded on the way out.
+    reworded on the way out. The one exception is the reload below, for a reason
+    that cannot be designed around; see there.
+
+    `single_use_containers=True` is what makes "the container is the worker" true
+    rather than aspirational. Containers are reused by default, and a worker leaves
+    this one holding open memmaps on its run's train.bin/valid.bin -- a cancelled or
+    crashed attempt never gets to close them, which is exactly the case that needs
+    to survive. The next input to land here would then fail on the reload below,
+    because a volume cannot be swapped while files under it are open. One input per
+    container means every attempt starts with nothing open, at the price of a cold
+    start per attempt -- nothing, against a training run.
     """
     try:
-        volume.reload() # fresh view
+        # A fresh view of what previous attempts committed. First, and before anything
+        # opens a file on the volume: reload replaces the mount and refuses outright
+        # while any file under it is open.
+        #
+        # That ordering is forced, and it is why a failure here is the one thing that
+        # never reaches the run's own worker.log -- the log file lives on this volume,
+        # so opening it before the reload would itself be what blocks the reload. This
+        # failure appears in the container log only. `modal app logs` is where to look.
+        volume.reload()
         call_id = modal.current_function_call_id()
         logdir = run_dir(run_id) / "logs" / call_id
         logdir.mkdir(parents=True, exist_ok=True)
-        logger = worker_logger(call_id, logdir / "worker.log")
+        logger = call_logger(call_id, logdir / "worker.log")
         # lease allows us to check ownership of the folder.
         lease = Lease(run_id, call_id, logger)
         try:
@@ -404,8 +474,10 @@ def work(run_id: str) -> dict:
                 # run, or was denied the lease and left without writing.
                 reason = str(e)
             else:
-                # Ask the job's progress rather than trust a return value.
-                done, total = JOB.progress(job.rdir, job.config)
+                # Ask the job's progress rather than trust a return value. The stored
+                # config, not a resolved one: `progress` is a classmethod the launcher
+                # also calls with nothing but a config.json in hand.
+                done, total = JOB.progress(job.rdir, job.config_dict)
                 reason = f"finished at {done}/{total}"
 
             # The tidy way out: say why we are leaving, publish it, and hand the
@@ -416,17 +488,20 @@ def work(run_id: str) -> dict:
             logger.exception("EXIT crashed: %r", e)
             raise
         finally:
-            release_worker_logger()
+            release_call_logger()
     except Exception as e:
         raise RuntimeError(f"worker failed for {run_id}: {e!r}") from e
 
 
 # What this deployment runs. One name, so the launcher and the worker cannot
 # disagree: the launcher calls JOB.progress to see if a folder is finished, the
-# worker builds a JOB to do the work. Swapping in a real trainer is this line
-# plus the image.
+# worker builds a JOB to do the work.
+#
+# `jobs.Count` is the toy that exercises the lease machinery without a GPU. Going
+# back to it means importing it here as well as naming it, and minting its flat
+# {total_steps, save_every} config by hand -- nothing writes one any more.
 # TODO: This will generalize so that it will pick up the job from config of the folder.
-JOB = Count
+JOB = Train
 
 
 # --------------------------------------------------------------------------------------
@@ -457,8 +532,127 @@ def dashboard():
 
 
 # --------------------------------------------------------------------------------------
+# the collector: Modal's own view of this app, onto the Volume
+# --------------------------------------------------------------------------------------
+
+COLLECT_HOURS = 6.0  # how long one session runs before closing itself cleanly
+
+
+@app.function(
+    image=collector_image,
+    volumes={STORAGE: volume},
+    # Comfortably longer than the session, so the deadline inside `capture` is
+    # always what ends it: a container killed by Modal's timeout instead would
+    # leave the session's sidecar without its closing line.
+    timeout=int(COLLECT_HOURS * 3600) + 600,
+    max_containers=1,
+    retries=0,
+)
+def collect(hours: float = COLLECT_HOURS, resume: bool = True) -> dict:
+    """Capture this app's own logs into launcher_logs/, one file per session.
+
+    Everything `modal app logs training-launcher` would show, made durable and
+    attributed: each line carries the function, container and call it came from.
+    That is the half of the story the run tree cannot hold -- a crash before a
+    worker's logger exists, an OOM after it is gone, `print()`, library warnings,
+    and `launch` and `dashboard`, which write no run-tree log at all.
+
+    Started explicitly, and that is a decision rather than an omission: a session
+    is one run of this function, so capture costs nothing when nobody is working,
+    and a gap between two sessions is a fact recorded in the index rather than
+    something the design pretends away.
+
+        modal run launcher/app.py::watch
+
+    `max_containers=1` is what stops two collectors writing the same tree and
+    duplicating every line. The price is that a second call *queues* behind the
+    first rather than being refused, so it starts whenever the running session
+    ends -- check for a live one before starting another.
+
+    All the machinery is in applog.py, which shares nothing with logs.py: this
+    writes what Modal saw, that writes what our own code said, and keeping them
+    apart is why neither can quietly become the other.
+    """
+    # First, and before applog opens a file on this mount: a reload refuses while
+    # any file under it is open, and the previous session's cursor is read off the
+    # volume. Containers are reused, so the snapshot is stale by default.
+    volume.reload()
+
+    # Imported here, not at module level: this module is imported by every
+    # container in the app and only the collector's image ships applog.
+    import applog
+
+    return applog.capture(volume, APP_NAME, hours=hours, resume=resume)
+
+
+# --------------------------------------------------------------------------------------
 # the ETL: the pipeline workflow, run against the Volume
 # --------------------------------------------------------------------------------------
+
+
+def run_logged(command: str, log) -> int:
+    """Run `command`, put every line it writes into `log`, and return its exit code.
+
+    `subprocess.run` inherits this process's stdout, which reaches Modal's container
+    log and nowhere else. Reading the pipe line by line instead puts snakemake's own
+    account of the DAG -- which rules ran, why, and what a failure said -- into the
+    run's own folder, where the dashboard merges it with the worker's log. It still
+    reaches the container log too: `log`'s second handler is stdout.
+
+    stderr is folded into stdout because snakemake writes its progress there and the
+    interleaving is the point -- one stream keeps the order things happened in.
+    PYTHONUNBUFFERED stops the child's stdout from block-buffering behind the pipe,
+    which would otherwise deliver a whole twenty-minute build in one lump at exit.
+    """
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        text=True,
+        bufsize=1,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    # Blank lines are kept: snakemake's job tables and rule blocks are readable
+    # because of them, and a bare timestamp is a cheap price for that.
+    for line in process.stdout:
+        log.info(line.rstrip())
+    return process.wait()
+
+
+def gather_run_data(run_id: str, log) -> None:
+    """Put this run's data in its own folder: train.bin, valid.bin, encoder.json.
+
+    PROVISIONAL, and the seam between a pipeline that builds one bin per source and
+    a trainer that wants one per split. Not a snakemake rule, so it is a deletion
+    rather than an untangling once a rule produces one shared bin per (encoder,
+    split) -- this function and its one call site go, and `jobs.split_bin` with
+    them. The cost meanwhile is a copy of the tokens per run.
+
+    Runs inside the ETL container, after the DAG is complete and before its commit,
+    so a worker never sees a run folder whose bins are half-joined. Imports the
+    pipeline's own etl.py from the read-only mount rather than reimplementing where
+    a bin lives -- the same module the Snakefile uses.
+    """
+    sys.path.insert(0, PIPELINE)
+    import etl as pipeline
+
+    rdir = run_dir(run_id)
+    data = f"{STORAGE}/data"
+
+    # From the request rather than the config: it carries the encoder's address,
+    # already derived and validated by the workflow that just ran.
+    request = pipeline.read_request(rdir)
+    uid = request["encoder"]["encoder_uid"]
+
+    for split in ("train", "valid"):
+        bins = [pipeline.encoded_bin(data, uid, uid_) for uid_ in request["sources"][f"{split}_sources"]]
+        target = pipeline.concat_bins(bins, split_bin(rdir, split))
+        log.info(f"{split}.bin  {len(bins)} sources -> {target.stat().st_size:,} bytes")
+
+    # What encoded those tokens, beside them, so a job can check vocab_size without
+    # knowing anything about where encoders live.
+    shutil.copyfile(pipeline.encoder_config(data, uid), encoder_record(rdir))
 
 
 @app.function(image=etl_image, volumes={STORAGE: volume}, cpu=4, timeout=3600, max_containers=1)
@@ -510,32 +704,79 @@ def etl(run_id: str) -> dict:
 
     volume.reload()  # containers are reused; start from what previous runs committed
 
-    # The target goes first, before any option: `--config` takes a variable-length
-    # list of key=value pairs, so a target after it would be swallowed as another
-    # pair and rejected as `Invalid config definition`.
-    command = (
-        "snakemake all"
-        f" --snakefile {PIPELINE}/Snakefile"
-        f" --directory {STORAGE}"
-        f" --workflow-profile {PIPELINE}/profiles/default"
-        f" --config volume={STORAGE} run_id={run_id}"
-    )
-    print(f"$ {command}")
+    # Before anything creates a directory. `mkdir(parents=True)` under a run_id that
+    # is not a run would mint a folder the dashboard then lists forever as
+    # "unreadable"; the workflow would fail on the missing config a minute later
+    # anyway. This fails first, and leaves nothing behind.
+    if load_config(run_id) is None:
+        raise RuntimeError(f"no readable config.json for {run_id} -- nothing to build")
 
-    # shell=True so what runs is exactly the line printed above. Bare `snakemake`
-    # resolves because uv_sync puts its venv's bin on PATH.
-    result = subprocess.run(command, shell=True)
+    # The same folder a worker logs into, named for this call, with the actor in the
+    # filename. That is the whole of what puts the ETL in the run's merged log view:
+    # `dashboard.read_logs` globs the folder and sorts on the timestamp column, so an
+    # `etl.log` beside a `worker.log` interleaves with no further plumbing.
+    #
+    # After the reload, never before -- reload refuses while a file on the volume is
+    # open, and this opens one.
+    call_id = modal.current_function_call_id()
+    logdir = run_dir(run_id) / "logs" / call_id
+    logdir.mkdir(parents=True, exist_ok=True)
+    log = call_logger(call_id, logdir / "etl.log")
 
-    # Commit either way. A failed workflow still finished some of its jobs, and
-    # those outputs plus the metadata describing them are exactly what makes the
-    # next run skip them -- discarding that is what would make failure costly.
-    # (snakemake deletes the output of the job that failed, so nothing half-written
-    # is being kept here.)
-    volume.commit()
+    returncode = None
+    try:
+        log.info(f"etl call_id={call_id} run_id={run_id}")
 
-    if result.returncode:
-        raise RuntimeError(f"snakemake exited {result.returncode}")
-    return {"run_id": run_id, "target": "all", "returncode": result.returncode}
+        # The target goes first, before any option: `--config` takes a variable-length
+        # list of key=value pairs, so a target after it would be swallowed as another
+        # pair and rejected as `Invalid config definition`.
+        #
+        # --nocolor because this output is now a file as well as a terminal: snakemake
+        # suppresses colour behind a pipe on its own, and the flag makes that a
+        # guarantee rather than something observed once.
+        command = (
+            "snakemake all"
+            f" --snakefile {PIPELINE}/Snakefile"
+            f" --directory {STORAGE}"
+            f" --workflow-profile {PIPELINE}/profiles/default"
+            " --nocolor"
+            f" --config volume={STORAGE} run_id={run_id}"
+        )
+        log.info(f"$ {command}")
+
+        # shell=True so what runs is exactly the line logged above. Bare `snakemake`
+        # resolves because uv_sync puts its venv's bin on PATH.
+        returncode = run_logged(command, log)
+
+        # Only once the DAG is complete: a partial build would concatenate whichever
+        # bins happen to exist into a file the trainer would read as authoritative.
+        if not returncode:
+            gather_run_data(run_id, log)
+
+        log.info(f"EXIT {'finished' if not returncode else f'snakemake exited {returncode}'}")
+
+        # Commit either way. A failed workflow still finished some of its jobs, and
+        # those outputs plus the metadata describing them are exactly what makes the
+        # next run skip them -- discarding that is what would make failure costly.
+        # (snakemake deletes the output of the job that failed, so nothing half-written
+        # is being kept here.) The log written above rides along on the same commit.
+        volume.commit()
+    except BaseException as e:
+        # While the handler is still attached, so the run's own folder records the
+        # crash rather than only the container log.
+        log.exception("EXIT crashed: %r", e)
+        raise
+    finally:
+        # Correctness here, not tidiness: this container is reused and every call
+        # starts with `volume.reload()`, which fails outright while a file under the
+        # mount is open. A leaked handler would break the *next* ETL call.
+        release_call_logger()
+
+    # After the log is closed and the commit has landed -- the nonzero exit is already
+    # recorded as an EXIT line, so this only needs to make the call fail.
+    if returncode:
+        raise RuntimeError(f"snakemake exited {returncode}")
+    return {"run_id": run_id, "target": "all", "returncode": returncode}
 
 
 # --------------------------------------------------------------------------------------
@@ -544,31 +785,53 @@ def etl(run_id: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(run_id: str = "", name: str = "run", total_steps: int = 20, save_every: int = 5, step_seconds: float = 1.0):
-    """Start or resume a run through the deployed launcher.
+def main(run_id: str):
+    """Resume a run through the deployed launcher.
+
+        modal run launcher/app.py --run-id 2026...._alpha
+
+    Resume only, and it passes no config at all: config.json was written once, at
+    creation, and every worker since runs under it. Starting a *new* run means
+    supplying that config, which lives in etl_train_pipeline.ipynb -- so the
+    notebook calls `launch` directly rather than this being able to mint one.
 
     `Function.from_name` is what keeps the lock intact. Calling `launch.remote`
     from this throwaway app instance would run it in a second container pool that
     doesn't serialize against the deployed one.
     """
     launcher = modal.Function.from_name(APP_NAME, "launch")
-    if run_id:
-        # A resume passes no config at all: config.json was written once, at
-        # creation, and every worker since runs under it.
-        print(launcher.remote(run_id=run_id))
-    else:
-        config = JOB.make_config(total_steps=total_steps, save_every=save_every, step_seconds=step_seconds)
-        print(launcher.remote(name=name, config=config))
+    print(launcher.remote(run_id=run_id))
+
+
+@app.local_entrypoint()
+def watch(hours: float = COLLECT_HOURS):
+    """Open a capture session on the deployed app, and return.
+
+        modal run launcher/app.py::watch
+        modal run launcher/app.py::watch --hours 1
+
+    `spawn`, not `remote`: the session runs for hours and nothing here wants to
+    wait for it. Through the deployed app for the usual reason -- a `modal run` of
+    this module gets its own container pool, so a locally-constructed collector
+    would not serialize against the deployed one and both would capture the same
+    lines into two different files.
+    """
+    collector = modal.Function.from_name(APP_NAME, "collect")
+    call = collector.spawn(hours=hours)
+    print(f"collecting {APP_NAME} for {hours}h -- call {call.object_id}")
+    print(f"  modal volume ls {VOLUME_NAME} launcher_logs")
 
 
 @app.local_entrypoint()
 def prepare(run_id: str):
-    """Build the data one run needs, on Modal.
+    """Rebuild the data one run needs, on Modal.
 
         modal run launcher/app.py::prepare --run-id 2026...._alpha
 
-    The same run_id `main` starts a run under: its request is read from
-    /storage/runs/{run_id}/run.yaml, which has to be on the Volume first.
+    `launch` already does this for every new run, so this is for doing it again on
+    its own -- after clearing an artifact, or to see the workflow's output without
+    starting a worker. Reads /storage/runs/{run_id}/config.json, which has to be on
+    the Volume already.
 
     Unlike `main`, this calls `etl.remote` on the local app rather than reaching
     for the deployed one. `main` needs `Function.from_name` because `launch`'s

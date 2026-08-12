@@ -1,21 +1,24 @@
 """The jobs the worker runs, and the folder layout they share.
 
 WHAT A JOB IS. Code that carries one run folder forward while a lease is held.
-`app.py` names one of these classes as `JOB` and needs exactly four things of it,
+`app.py` names one of these classes as `JOB` and needs exactly three things of it,
 which is the whole contract -- no base class states it, because two classes
-implementing four members do not need a third class to agree:
+implementing three members do not need a third class to agree:
 
-    JOB(lease, run_id)              construct: read config.json, resume or start
+    JOB(lease, run_id, logger)      construct: read config.json, resume or start
     job.run()                       carry the folder forward; takes and returns nothing
     JOB.progress(rdir, config)      (done, total) from committed files alone
-    JOB.make_config(**kwargs)       mint the config.json a launch writes
 
-`run` is an instance method because it needs the lease. `progress` and
-`make_config` are classmethods because the launcher calls them with no attempt
-and no lease in hand: to decide a folder is finished before spawning anyone, and
-to mint a config at the CLI. `progress` raises Aborted rather than crashing on a
-config it does not understand -- callers scan whole directories of folders, some
-written by other tools entirely, so "not mine" has to be an answer.
+`run` is an instance method because it needs the lease. `progress` is a
+classmethod because the launcher calls it with no attempt and no lease in hand,
+to decide a folder is finished before spawning anyone. It raises Aborted rather
+than crashing on a config it does not understand -- callers scan whole directories
+of folders, some written by other tools entirely, so "not mine" has to be an
+answer.
+
+Nothing mints a config here any more. A run's config.json comes from the config
+dict in etl_train_pipeline.ipynb, serialized and handed to `launch`, which is the
+only writer of that file. `Count.make_config` survives for the toy alone.
 
 `run` returns nothing on purpose, and that is what makes an attempt safe to
 repeat: where to start comes from the folder, and what got done comes from
@@ -32,13 +35,27 @@ were superseded. The safe pattern is to hold un-owned writes in memory -- see
 `pending` in either job -- and touch shared files only inside
 `with self.lease(..., commit=True)`.
 
-Both jobs therefore have the same three-line shape at a boundary, written out at
-each site rather than shared through a base class, because seeing the ordering is
-the point:
+Both jobs therefore do their writing at a boundary inside the lease, written out
+at each site rather than shared through a base class, because seeing the ordering
+is the point. The two orders differ, and the difference is the whole argument:
 
-    with self.lease(label, commit=True):
-        <write the checkpoint>          # first, so a committed row never
-        <append the buffered rows>      # names a file that isn't there
+    Count                                   Train
+    with self.lease(label, commit=True):    with self.lease(label, commit=True):
+        <write the checkpoint>                  <append the buffered rows>
+        <append the buffered rows>              <send those rows to W&B>
+                                                <write the checkpoint>
+
+Count writes its checkpoint first, so a committed row never describes a step
+whose checkpoint is missing. It can afford that because everything it reports is
+on the volume: whatever a failed attempt did not commit simply never happened.
+
+Train reports to W&B as well, and W&B cannot be rolled back or written twice --
+it refuses a step it has already passed. So its checkpoint goes last, making the
+checkpoint mean "every row up to here has been reported". A resume starts from
+the checkpoint, so an attempt that died before writing one re-runs that interval
+and reports it again: duplicate ledger rows, distinguishable by call_id, and W&B
+taking whichever steps it missed. Duplicates are recoverable; the interval that
+checkpoint-first lost between its commit and its W&B send was not.
 
 STDLIB AT IMPORT. `app.py` and `dashboard.py` import this module, and their
 containers have no torch, numpy, or wandb. Every heavy import is therefore lazy,
@@ -50,15 +67,21 @@ import time
 from datetime import datetime, UTC
 from pathlib import Path
 
-# The volume mount, as seen inside the containers, and the three trees on it. A
-# config's train_path/valid_path are relative to VOLUME, not to a run folder --
-# the same convention transformer.util.run_training reads them under, so one
-# config.json resolves identically whether it runs here or there:
-#     VOLUME/data/{dataset}/bin/{tokenizer_uid}/{split}.bin   input, from the ETL
-#     VOLUME/tokenizers/{tokenizer_uid}/config.json           input, from the ETL
-#     VOLUME/runs/{run_id}/                                   output, this job's
+# The volume mount, as seen inside the containers, and the two trees on it:
+#     VOLUME/data/encoders/{encoder_uid}/{source_uid}.bin   the ETL's output, shared
+#     VOLUME/runs/{run_id}/                                 one run, input and output
+# A run folder is self-describing -- config.json says what to do, train.bin and
+# valid.bin are the data to do it to, encoder.json says what encoded them -- so a
+# job resolves everything it needs from `run_id` alone and reads no path out of a
+# config. See `split_bin` for why the bins are copied in rather than read in place.
 VOLUME = Path("/storage")
 RUNS = VOLUME / "runs"
+
+# Modal's own view of the app -- every container's stdout and stderr, plus the
+# lifecycle events no container is around to write down -- captured per session by
+# launcher/applog.py. A sibling of runs/, not a child of one: a session spans every
+# run alive during it and belongs to none of them.
+LAUNCHER_LOGS = VOLUME / "launcher_logs"
 
 
 class Aborted(Exception):
@@ -93,6 +116,29 @@ def mint_run_id(name: str) -> str:
 def utc() -> str:
     """JS-friendly UTC timestamp, matching transformer.util's ledger rows."""
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def split_bin(rdir: Path, split: str) -> Path:
+    """This run's encoded tokens for one split, "train" or "valid".
+
+    PROVISIONAL. The pipeline builds one bin per source, under the encoder that
+    encoded it; a trainer wants one per split. These are those bins joined end to
+    end and copied into the run folder by `etl` -- duplicated bytes per run, and
+    outside the DAG, so snakemake does not know they exist. Both deliberate: when a
+    snakemake rule produces one shared bin per (encoder, split) instead, this
+    function and its caller are a deletion rather than an untangling.
+
+    A function of (rdir, split) so the ETL that writes these and the job that reads
+    them cannot disagree about the name.
+    """
+    return rdir / f"{split}.bin"
+
+
+def encoder_record(rdir: Path) -> Path:
+    """The definition of the encoder that produced this run's bins, copied in beside
+    them by `etl`. What makes a vocab_size check possible without the job knowing
+    anything about where encoders live."""
+    return rdir / "encoder.json"
 
 
 def checkpoint_path(rdir: Path, step: int) -> Path:
@@ -131,28 +177,20 @@ def committed_step(rdir: Path) -> int:
 # --------------------------------------------------------------------------------------
 
 
-class ETL:
-    """downloads text and BPE tokenizes.
-     
-       """
-    def __init__(self, lease, run_id: str):
-        """"""
-        pass
-
-    def download(self):
-        pass
-
-
 class Train:
-    """Trains a TransformerLM to training.total_iterations, checkpointing every
-    training.save_every.   
+    """Trains a TransformerLM to training.total_steps, checkpointing every
+    training.save_every.
+
+    Its data is this run's train.bin/valid.bin, joined into the run folder by the
+    ETL before the worker was spawned -- no path comes out of the config.
     """
 
-    def __init__(self, lease, run_id: str):
-        # A lease and a unique folder name {run_id} is everything a job gets.
+    def __init__(self, lease, run_id: str, logger):
+        # A lease, a unique folder name {run_id}, and the worker's logger is
+        # everything a job gets.
         self.lease = lease
         self.run_id = run_id
-        self.log = log
+        self.log = logger
         self.rdir = run_dir(run_id)
 
         self.config_dict = load_config(run_id)
@@ -268,33 +306,33 @@ class Train:
         return rows
 
     def validate_data(self, config: dict) -> None:
-        """Fail before training on a config whose data bins are missing, or whose
-        vocab_size disagrees with the tokenizer that produced them. Lifted from
+        """Fail before training if this run's bins are missing, or if the encoder
+        that produced them disagrees with the model about vocab_size. Lifted from
         transformer.util.run_training.
 
-        These paths hang off VOLUME, not off the run folder: the bins and the
-        tokenizer are shared ETL output that every run reads, so a config records
-        them relative to the volume root and resolves the same way here as in
-        run_training. Raises Aborted rather than the bare
-        FileNotFoundError/ValueError run_training used: a run that cannot proceed
-        is one to leave alone, not crash-loop.
+        Everything checked here lives in the run folder, put there by `etl` before
+        this worker was spawned -- no path comes out of the config, so a config
+        cannot point at data it did not ask for. Raises Aborted rather than the bare
+        FileNotFoundError/ValueError run_training used: a run that cannot proceed is
+        one to leave alone, not crash-loop.
         """
-        train_path = VOLUME / config["training"]["train_path"]
-        valid_path = VOLUME / config["training"]["valid_path"]
-        if not train_path.exists():
-            raise Aborted(f"train_path not found: {train_path}")
-        if not valid_path.exists():
-            raise Aborted(f"valid_path not found: {valid_path}")
+        for split in ("train", "valid"):
+            path = split_bin(self.rdir, split)
+            if not path.exists():
+                raise Aborted(f"{split}.bin not found: {path} -- was the ETL run for this run_id?")
 
-        # tokenizer-specific: tokenizer_uid is train_path's parent dir name
-        # (data/{dataset_name}/bin/{tokenizer_uid}/{split}.bin) -- the single source
-        # of truth for which tokenizer produced these bins.
-        tokenizer_uid = train_path.parent.name
-        tokenizer_config = json.loads((VOLUME / "tokenizers" / tokenizer_uid / "config.json").read_text())
-        if tokenizer_config["vocab_size"] != config["model_params"]["vocab_size"]:
+        record = encoder_record(self.rdir)
+        if not record.exists():
+            raise Aborted(f"encoder.json not found: {record} -- was the ETL run for this run_id?")
+
+        # The encoder's own recorded definition, so this compares the model against
+        # what actually produced the token ids in those bins.
+        encoder = json.loads(record.read_text())
+        vocab_size = encoder["params"]["vocab_size"]
+        if vocab_size != config["model_params"]["vocab_size"]:
             raise Aborted(
                 f"model_params.vocab_size ({config['model_params']['vocab_size']}) does not match "
-                f"tokenizer {tokenizer_uid!r}'s vocab_size ({tokenizer_config['vocab_size']})"
+                f"encoder {encoder.get('encoder_uid')!r}'s vocab_size ({vocab_size})"
             )
 
     def get_batch(self, data, batch_seed: tuple):
@@ -386,7 +424,7 @@ class Train:
             self.lr_schedule_params = c["lr_schedule_params"]
 
             tc = c["training"]
-            self.total_steps = tc["total_iterations"]
+            self.total_steps = tc["total_steps"]
             self.save_every = tc["save_every"]
             self.val_every = tc["val_every"]
             self.batch_size = tc["batch_size"]
@@ -395,8 +433,11 @@ class Train:
         except KeyError as e:
             raise Aborted(f"config.json is missing {e}") from None
 
-        self.train_data = np.memmap(VOLUME / tc["train_path"], dtype=np.uint16, mode="r")
-        self.valid_data = np.memmap(VOLUME / tc["valid_path"], dtype=np.uint16, mode="r")
+        # From the run folder, not from the config: `etl` joined this run's per-source
+        # bins into these two before the worker was spawned. uint16 is what the
+        # encoder writes, and validate_data has already checked the vocab fits it.
+        self.train_data = np.memmap(split_bin(self.rdir, "train"), dtype=np.uint16, mode="r")
+        self.valid_data = np.memmap(split_bin(self.rdir, "valid"), dtype=np.uint16, mode="r")
 
         # build model + optimizer from the resolved config; seed first, so init
         # weights are reproducible (must happen before construction).
@@ -415,7 +456,7 @@ class Train:
             # self.step/self.attempt are set just above -- save_checkpoint reads them.
             with self.lease(f"boundary at step 0/{self.total_steps}", commit=True):
                 self.save_checkpoint()
-            logger.info("Train: fresh run %s (attempt 1, %d total steps)", self.rdir.name, self.total_steps)
+            self.log.info("Train: fresh run %s (attempt 1, %d total steps)", self.rdir.name, self.total_steps)
         else:
             checkpoint = torch.load(latest_checkpoint_path(self.rdir), map_location=self.device)
             self.model.load_state_dict(checkpoint["model"])
@@ -477,28 +518,41 @@ class Train:
                 if self.step % self.save_every == 0 or self.step == self.total_steps:
                     label = f"boundary at step {self.step}/{self.total_steps} (attempt {self.attempt})"
                     # Entering proves we still own the run, exiting commits. If we
-                    # were superseded, entry raises LeaseLost and neither the
-                    # checkpoint nor the rows are written -- which unwinds this
-                    # loop as a clean stop, and the buffered rows die with the
-                    # container, which is what should happen to an interval we no
-                    # longer owned. Checkpoint first, so a committed row never
-                    # names a file that isn't there.
+                    # were superseded, entry raises LeaseLost and nothing in here
+                    # runs -- which unwinds this loop as a clean stop, and the
+                    # buffered rows die with the container, which is what should
+                    # happen to an interval we no longer owned.
+                    #
+                    # The checkpoint is written LAST, and that ordering is the whole
+                    # durability argument: reaching a checkpoint means every row it
+                    # covers has already been reported, to the ledger and to W&B
+                    # both. A resume starts from the checkpoint's step, so there is
+                    # no interval that is durable-but-unreported -- an attempt that
+                    # dies before writing its checkpoint re-runs that interval and
+                    # reports it again.
+                    #
+                    # The price is paid in duplicates rather than in losses: the
+                    # ledger gets a second copy of those rows, told apart by their
+                    # call_id, and W&B refuses the steps it already accepted while
+                    # taking the ones it missed -- so its history heals itself. A
+                    # repeated step is a shape the dashboard already renders and a
+                    # reader can group by attempt; a permanently missing interval,
+                    # which is what checkpoint-first cost us, is neither.
+                    #
+                    # W&B is inside the gate for the same reason, which does widen
+                    # the window between the ownership check and the commit by one
+                    # buffered log call per step. That is a local append in wandb's
+                    # client, and a superseded worker widening it costs at most the
+                    # one duplicated interval already accounted for above.
                     with self.lease(label, commit=True):
-                        self.save_checkpoint()
                         rows = self.flush_pending()
-                    logger.info("Train: %s for %s", label, self.rdir.name)
-
-                    # W&B after the commit, and outside the gate: these rows are
-                    # durable now, so W&B can never hold an interval the ledger
-                    # doesn't have, and a burst of log calls never widens the
-                    # window between the ownership check and the commit. Logging
-                    # only at boundaries is also what keeps W&B's step monotonic
-                    # across attempts -- wandb refuses to log to a step it has
-                    # already passed, and an attempt that died mid-interval sent
-                    # nothing, so the one that resumes starts exactly where W&B is.
-                    for step in sorted(rows):
-                        # ts and call_id are the ledger's provenance, not metrics.
-                        self.wb.log({k: v for k, v in rows[step].items() if k not in ("ts", "call_id")}, step=step)
+                        for step in sorted(rows):
+                            # ts and call_id are the ledger's provenance, not metrics.
+                            self.wb.log(
+                                {k: v for k, v in rows[step].items() if k not in ("ts", "call_id")}, step=step
+                            )
+                        self.save_checkpoint()
+                    self.log.info("Train: %s for %s", label, self.rdir.name)
         except BaseException as exc:
             # Purely for visibility -- deliberately re-raised unchanged, not
             # swallowed. `step` is whatever was in progress when this fired,
@@ -531,13 +585,13 @@ class Train:
         not just a dict with the wrong keys.
         """
         try:
-            total = config["training"]["total_iterations"]
+            total = config["training"]["total_steps"]
         except (KeyError, TypeError):
-            raise Aborted("config.json is not for this job (no training.total_iterations)") from None
+            raise Aborted("config.json is not for this job (no training.total_steps)") from None
         return committed_step(rdir), total
 
     def run(self) -> None:
-        """Carry this folder to total_iterations, checkpointing every save_every.
+        """Carry this folder to total_steps, checkpointing every save_every.
 
         Takes nothing and returns nothing, which is what makes it safe to call
         again: the starting point comes from the folder -- `configure` already
@@ -594,9 +648,10 @@ class Count:
     that is three lines in both and reads the same in both.
     """
 
-    def __init__(self, lease, run_id: str):
+    def __init__(self, lease, run_id: str, logger):
         self.lease = lease
         self.run_id = run_id
+        self.log = logger
         self.rdir = run_dir(run_id)
 
         self.config_dict = load_config(run_id)
@@ -672,7 +727,7 @@ class Count:
             with self.lease(label, commit=True):
                 self.save_checkpoint(step)
                 self.flush_pending()
-            logger.info("Count: %s for %s", label, self.rdir.name)
+            self.log.info("Count: %s for %s", label, self.rdir.name)
 
     def flush_pending(self) -> None:
         """Append the buffered rows to train.jsonl and drop them.

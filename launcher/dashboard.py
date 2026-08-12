@@ -15,13 +15,21 @@ installed.
 
 import asyncio
 import json
+from pathlib import Path
 
 import modal
 
+import applog
 from app import JOB, APP_NAME, lease_key, leases, status, volume
 from jobs import RUNS, Aborted, load_config, run_dir
 
 REFRESH_MS = 3000  # how often the page asks for fresh rows
+
+# How many log lines one page will draw. A training attempt writes a line per
+# checkpoint; an ETL that has to fit an encoder writes snakemake's entire account
+# of the DAG, which is what makes a cap worth having. The newest lines are the
+# ones kept -- a log is read from the end.
+MAX_LOG_LINES = 5000
 
 # What each derived status is called on screen. The colour lives in the stylesheet
 # as `.st-<status>`, so light and dark can differ -- plain coloured text has to
@@ -30,13 +38,13 @@ STATUS_LABEL = {
     "completed": "Completed",
     "in_progress": "Running",
     "starting": "Starting",
-    "failed": "Failed",
-    "orphaned": "Orphaned",
+    "stopped": "Stopped",
+    "new": "New",
     "unreadable": "Unreadable",
 }
 
 CANCELLABLE = {"in_progress", "starting"}
-RESUMABLE = {"failed", "orphaned"}
+RESUMABLE = {"new", "stopped"}
 
 # Drawn in currentColor so they inherit hover states. Deliberately different
 # shapes rather than different colours: three lines for a log, bars for a ledger.
@@ -50,43 +58,62 @@ LEDGER_ICON = (
 )
 
 
-def derive_status(complete: bool, done: int, live: str | None) -> str:
-    """Fold progress and liveness into one word.
+def derive_status(complete: bool, done: int, live: str | None, started: bool) -> str:
+    """Fold progress, liveness and history into one word.
 
     `complete` wins outright and is decided from committed files alone -- a
     finished run must read finished forever, and Modal eventually forgets old call
     outcomes, so we never ask about them.
 
-    Otherwise `live` decides. `orphaned` is the honest "cannot know" case: the
-    lease expired, or there is no key at all. It is not an error state -- it is
-    the normal look of a run nobody has touched in a while, and it is resumable.
+    Otherwise `live` says whether anyone is on it, and when nobody is, `started`
+    separates the two very different reasons for that:
+
+      `new`     -- no worker has ever booted here. The normal look of a run whose
+                   ETL is still building, or one whose data is ready and whose
+                   launcher has not spawned yet. Nothing has gone wrong.
+      `stopped` -- it ran, and it is not running now.
+
+    `stopped` covers a crash, a cancel, a preemption and an expired lease alike,
+    on purpose. The dashboard cannot honestly tell them apart -- Modal forgets old
+    call outcomes, and a lease the launcher popped looks exactly like one that was
+    never granted -- and all of them want the same thing done about them. The
+    worker's own log is where which-one-it-was is written down.
     """
     if complete:
         return "completed"
     if live == "running":
         return "in_progress" if done else "starting"
-    if live in ("done", "failed", "crashed", "timed_out"):
-        return "failed"
-    return "orphaned"  # expired, or no lease key
+    return "stopped" if started else "new"
 
 
-def live_step(run_id: str, call_id: str | None) -> int | None:
-    """The step this attempt last wrote to its own progress file, or None.
+def live_step(rdir: Path) -> int | None:
+    """The furthest step any attempt has written to its progress file, or None.
 
-    Display only, and never an input to a decision -- `JOB.progress` still reads
-    checkpoints, because only those are durable. This file is written with no
-    lease and published by Modal's background commits, so it is as fresh as those
-    happen to be and it can name a step whose work was never committed.
+    Read off the volume along with the rest of a run's state, and gated by
+    nothing -- not liveness, not the lease. This is display only; `JOB.progress`
+    still reads checkpoints, because only those are durable.
 
-    Missing is the normal case, not an error: a job that doesn't write one, an
-    attempt that hasn't reached its first step, or a commit that hasn't landed.
+    The file carries no commit of its own and rides Modal's background commits,
+    so it is exactly as fresh as those happen to be. Nothing here waits on that
+    or works around it: when there is nothing to read, the ghost bar simply does
+    not draw. Missing is the ordinary case, not an error -- a job that writes no
+    progress file, an attempt that has not reached its first step, or a commit
+    that has not landed yet.
+
+    Stale is ordinary too, and needs no guarding: `rows_html` only draws a step
+    that is *ahead* of the last checkpoint, so a dead attempt's leftover file
+    stops showing by itself the moment a later checkpoint passes it. Taking the
+    furthest step rather than the current attempt's is what lets this ignore the
+    lease entirely; the cost is that a superseded attempt which got further than
+    the live one keeps its ghost until the next checkpoint.
     """
-    if call_id is None:
-        return None
-    try:
-        return json.loads((run_dir(run_id) / "logs" / call_id / "progress.json").read_text())["step"]
-    except (OSError, ValueError, KeyError):
-        return None
+    steps = []
+    for progress in rdir.glob("logs/*/progress.json"):
+        try:
+            steps.append(json.loads(progress.read_text())["step"])
+        except (OSError, ValueError, KeyError):
+            continue  # torn mid-write, or not a progress file we understand
+    return max(steps, default=None)
 
 
 async def scan() -> list[dict]:
@@ -119,7 +146,25 @@ async def scan() -> list[dict]:
             runs.append({"run_id": run_id, "status": "unreadable", "done": None, "total": None, "attempt": None})
             continue
 
-        runs.append({"run_id": run_id, "done": done, "total": total, "complete": done >= total})
+        # A worker's own log file, not the `logs/` folder: the ETL writes
+        # `logs/{call_id}/etl.log` into that same folder before any worker is
+        # spawned, so the folder's existence stopped meaning "a worker booted here"
+        # the moment the ETL started logging. `worker.log` is written by `work` and
+        # by nothing else, which is the fact this actually wants.
+        #
+        # Not "config.json is the only file" either, for the same reason: the ETL
+        # leaves run.yaml, encoder.json and the bins here too, so a run between a
+        # finished build and its first worker would read as started.
+        runs.append(
+            {
+                "run_id": run_id,
+                "done": done,
+                "total": total,
+                "complete": done >= total,
+                "started": any(rdir.glob("logs/*/worker.log")),
+                "live_step": live_step(rdir),
+            }
+        )
 
     pending = [r for r in runs if "complete" in r and not r["complete"]]
     grants = await asyncio.gather(*(leases.get.aio(lease_key(r["run_id"])) for r in pending))
@@ -129,16 +174,11 @@ async def scan() -> list[dict]:
 
     for row, grant, state in zip(pending, grants, live):
         row["attempt"] = grant["attempt"] if grant else None
-        row["call_id"] = grant["call_id"] if grant else None
-        row["status"] = derive_status(False, row["done"], state)
-        # Only for a run that is actually alive: the file outlives the attempt
-        # that wrote it, so on a dead run it would report a step nobody is on.
-        row["live_step"] = live_step(row["run_id"], row["call_id"]) if row["status"] in CANCELLABLE else None
+        row["status"] = derive_status(False, row["done"], state, row["started"])
 
     for row in runs:
-        row.setdefault("status", "completed" if row.get("complete") else "orphaned")
+        row.setdefault("status", "completed" if row.get("complete") else "stopped")
         row.setdefault("attempt", None)
-        row.setdefault("call_id", None)
     return runs
 
 
@@ -148,18 +188,24 @@ async def _no_lease():
     return None
 
 
-async def read_logs(run_id: str) -> list[tuple[str, str, str]]:
-    """Every worker's log for one run, merged into one stream in time order.
+async def read_logs(run_id: str) -> list[tuple[str, str, str, str]]:
+    """Every log in one run's folder, merged into one stream in time order.
 
     Each line is written as `<iso-timestamp> <message>`, so the timestamp is
     simply the first column. They are all UTC and all the same width, which means
     sorting the strings sorts the times -- no parsing into datetimes needed.
 
-    Interleaving matters here. Workers overlap: a superseded worker is still
-    logging while its replacement boots, and reading two files side by side hides
-    that. Merged and sorted, a takeover reads as one story.
+    Two actors write here and the path says which: `logs/{call_id}/worker.log` is a
+    training attempt, `logs/{call_id}/etl.log` is the build that prepared its data.
+    One Modal call is one directory, so the directory holds exactly one file and
+    its *name* is free to say who wrote it -- no manifest, nothing to keep in sync.
 
-    Returns (timestamp, call_id, message) per line.
+    Interleaving is the whole point. Calls overlap: a superseded worker is still
+    logging while its replacement boots, and a resume's ETL runs while the previous
+    attempt's file sits beside it. Merged and sorted, that reads as one story
+    instead of three files to line up by eye.
+
+    Returns (timestamp, call_id, actor, message) per line.
     """
     await volume.reload.aio()
 
@@ -168,10 +214,8 @@ async def read_logs(run_id: str) -> list[tuple[str, str, str]]:
         return []
 
     lines = []
-    for worker_dir in sorted(logs_dir.iterdir()):
-        log = worker_dir / "worker.log"
-        if not log.is_file():
-            continue
+    for log in sorted(logs_dir.glob("*/*.log")):
+        call_id, actor = log.parent.name, log.stem
         last_ts = ""
         for line in log.read_text(errors="replace").splitlines():
             if not line.strip():
@@ -181,7 +225,7 @@ async def read_logs(run_id: str) -> list[tuple[str, str, str]]:
                 last_ts = ts
             else:  # no leading timestamp: keep it next to the line it follows
                 ts, msg = last_ts, line
-            lines.append((ts, worker_dir.name, msg))
+            lines.append((ts, call_id, actor, msg))
 
     lines.sort(key=lambda row: (row[0], row[1]))
     return lines
@@ -235,17 +279,40 @@ def rows_html(runs: list[dict]) -> str:
             # live attempt has got to since its last checkpoint. Two different
             # facts -- one survives a crash, the other does not -- so they are
             # drawn differently rather than added together.
+            #
+            # The caption is deliberately not gated on the ghost having width.
+            # A boundary writes the progress file and the checkpoint at the same
+            # step, and the commit that publishes the checkpoint publishes that
+            # file with it -- so at every boundary the two numbers coincide and
+            # the ghost has nothing left to draw. Gated on the same test, "· at N"
+            # blinked out at each boundary and came back a step later. A reading
+            # level with the checkpoint is still a reading, and saying so keeps
+            # the row the same shape from one poll to the next.
             step = r.get("live_step")
             ghost = ""
-            if step is not None and step > done:
-                ghost = f"<div class='fill live' style='width:{min(100.0, 100 * step / total):.1f}%'></div>"
+            if step is not None and step >= done:
                 progress += f" <span class='muted'>· at {step:,}</span>"
+                if step > done:  # a zero-width ghost draws the same as no ghost
+                    ghost = f"<div class='fill live' style='width:{min(100.0, 100 * step / total):.1f}%'></div>"
             bar = f"<div class='bar'>{ghost}<div class='fill' style='width:{pct:.1f}%'></div></div>"
 
+        # `data-busy` is the label to show while the POST is in flight, carried on
+        # the element so the script never has to know the status vocabulary.
         if status_key in CANCELLABLE:
-            action = f"<button class='cancel' data-act='cancel' data-run='{name}'>Cancel</button>"
+            action = (
+                f"<button class='cancel' data-act='cancel' data-busy='Cancelling…' "
+                f"data-run='{name}'>Cancel</button>"
+            )
         elif status_key in RESUMABLE:
-            action = f"<button class='resume' data-act='resume' data-run='{name}'>Resume</button>"
+            # One route and one call: `launch` does not distinguish starting a run
+            # from resuming one, and must not -- deciding which it is happens inside
+            # its lock, on evidence this page is too far away to have. Only the word
+            # differs, because to someone reading the row they are different events.
+            verb, busy = ("Start", "Starting…") if status_key == "new" else ("Resume", "Resuming…")
+            action = (
+                f"<button class='resume' data-act='resume' data-busy='{busy}' "
+                f"data-run='{name}'>{verb}</button>"
+            )
         else:
             action = ""
 
@@ -297,7 +364,7 @@ def page_html(runs: list[dict]) -> str:
   @media (prefers-color-scheme: dark) {{
     .st-completed {{ color:#3fb950; }}
     .st-in_progress {{ color:#d29922; }}
-    .st-failed {{ color:#f85149; }}
+    .st-stopped {{ color:#f85149; }}
     .st-unreadable {{ color:#bc8cff; }}
   }}
   table {{ width:100%; border-collapse:collapse; }}
@@ -310,9 +377,11 @@ def page_html(runs: list[dict]) -> str:
   .st {{ font-weight:600; font-size:.78rem; }}
   .st-completed {{ color:#1a7f37; }}
   .st-in_progress {{ color:#9a6700; }}
-  .st-failed {{ color:#cf222e; }}
+  .st-stopped {{ color:#cf222e; }}
   .st-unreadable {{ color:#8250df; }}
-  .st-starting, .st-orphaned {{ color:var(--muted); font-weight:500; }}
+  /* `new` is not an outcome and nothing has gone wrong in it -- it reads like
+     `starting`, quiet, rather than competing with the states that did happen. */
+  .st-starting, .st-new {{ color:var(--muted); font-weight:500; }}
   /* inline, not stacked above the numbers -- stacking is what made rows tall */
   .bar {{ display:inline-block; vertical-align:middle; margin-right:.5rem; width:110px; height:4px;
           border-radius:2px; background:var(--line); overflow:hidden; position:relative; }}
@@ -335,6 +404,7 @@ def page_html(runs: list[dict]) -> str:
   <header>
     <h1>Runs</h1>
     <span class='muted small' id='meta'>{len(runs)} runs</span>
+    <span class='muted small'>· <a href='sessions'>sessions</a></span>
   </header>
   <table>
     <thead><tr><th>Run</th><th>Status</th><th>Progress</th><th>Attempt</th><th></th></tr></thead>
@@ -360,7 +430,7 @@ rows.addEventListener('click', async (e) => {{
   const b = e.target.closest('button[data-act]');
   if (!b) return;
   b.disabled = true;
-  b.textContent = b.dataset.act === 'cancel' ? 'Cancelling…' : 'Resuming…';
+  b.textContent = b.dataset.busy;
   try {{ await fetch(`${{b.dataset.act}}/${{b.dataset.run}}`, {{method: 'POST'}}); }} catch (e) {{}}
   refresh();
 }});
@@ -370,10 +440,10 @@ setInterval(refresh, {REFRESH_MS});
 </body></html>"""
 
 
-# One colour per worker, assigned in order of appearance. The point is not
-# decoration: when two workers overlap, colour is what lets you see the handover
+# One colour per call, assigned in order of appearance. The point is not
+# decoration: when two calls overlap, colour is what lets you see the handover
 # at a glance instead of comparing call ids character by character.
-WORKER_COLOURS = ["#0969da", "#8250df", "#bf8700", "#1a7f37", "#cf222e", "#0f766e"]
+CALL_COLOURS = ["#0969da", "#8250df", "#bf8700", "#1a7f37", "#cf222e", "#0f766e"]
 
 
 LOG_CSS = """
@@ -382,36 +452,141 @@ LOG_CSS = """
   .line { display:flex; gap:1rem; padding:.18rem 0; border-bottom:1px solid var(--line); }
   .line:hover { background:color-mix(in srgb, var(--fg) 5%, transparent); }
   .line.hi .msg { font-weight:600; }
-  .ts { color:var(--muted); flex:0 0 auto; }
+  .line.off { display:none; }
+  /* the last line of a same-instant burst keeps the rule; the ones above it drop
+     it, so a traceback reads as one block instead of a stack of framed rows */
+  .line.nb { border-bottom:none; }
+  /* fixed width, because a continuation line leaves it empty and the columns
+     still have to line up under the timestamp they belong to */
+  .ts { color:var(--muted); flex:0 0 24ch; }
   .num { color:var(--muted); flex:0 0 3rem; text-align:right; }
   .att { flex:0 0 auto; font-weight:600; font-size:.72rem; letter-spacing:.02em; }
+  .actor { flex:0 0 3.2rem; color:var(--muted); font-size:.72rem; }
   .msg { white-space:pre-wrap; word-break:break-word; }
+  .msg.err { color:#cf222e; }
+  @media (prefers-color-scheme: dark) { .msg.err { color:#f85149; } }
   .empty { color:var(--muted); padding:2rem 0; }
   .legend { display:flex; gap:.9rem; margin-bottom:.8rem; font-size:.72rem; }
+  .chips { display:flex; gap:.4rem; margin-bottom:.8rem; }
+  .chip { font:inherit; font-size:.72rem; padding:.1rem .55rem; border-radius:999px; cursor:pointer;
+          border:1px solid var(--line); background:transparent; color:var(--muted); }
+  .chip:hover { border-color:var(--accent); }
+  .chip.on { color:var(--accent); border-color:var(--accent); }
 """
 
 
-def logs_page_html(run_id: str, lines: list[tuple[str, str, str]]) -> str:
-    """One run's merged log, as its own page in its own tab."""
+def merged_lines_html(rows: list[dict]) -> str:
+    """The `.line` divs for any merged log, with same-instant bursts drawn as blocks.
+
+    Shared by the run view and the session view, so the one rule they both depend
+    on cannot drift between them: a line that shares its timestamp *and* its
+    `group` with the line above leaves the timestamp column empty, and the line
+    above drops its rule. A traceback or a snakemake job table then reads as one
+    block instead of a stack of framed rows repeating the same millisecond.
+
+    Both keys, not just the timestamp. Lines are sorted by time, so two different
+    sources logging in the same millisecond land adjacent -- and drawing those as
+    one block would claim a relationship between them that isn't there.
+
+    Each row: `ts`, `group`, `colour`, `badge`, `tag`, `message`, and the optional
+    flags `hi` (bold), `err` (stderr) and `filter` (which chip shows it).
+    """
     import html
 
-    workers = list(dict.fromkeys(call_id for _, call_id, _ in lines))
-    colour = {c: WORKER_COLOURS[i % len(WORKER_COLOURS)] for i, c in enumerate(workers)}
+    out = []
+    for i, row in enumerate(rows):
+        key = (row["ts"], row["group"])
+        continues = i > 0 and (rows[i - 1]["ts"], rows[i - 1]["group"]) == key
+        continued = i + 1 < len(rows) and (rows[i + 1]["ts"], rows[i + 1]["group"]) == key
+
+        classes = "line" + (" hi" if row.get("hi") else "") + (" nb" if continued else "")
+        out.append(
+            f"<div class='{classes}' data-filter='{html.escape(row.get('filter', ''))}'>"
+            f"<span class='ts'>{'' if continues else html.escape(row['ts'])}</span>"
+            f"<span class='att' style='color:{row['colour']}'>{html.escape(row['badge'])}</span>"
+            f"<span class='actor'>{html.escape(row.get('tag', ''))}</span>"
+            f"<span class='msg{' err' if row.get('err') else ''}'>{html.escape(row['message'])}</span>"
+            "</div>"
+        )
+    return "".join(out)
+
+
+def chips_html(values: list[str]) -> str:
+    """Filter chips, or nothing when there is only one thing to filter for."""
+    import html
+
+    if len(values) < 2:
+        return ""
+    buttons = "".join(
+        f"<button class='chip{' on' if v == 'all' else ''}' data-filter='{html.escape(v)}'>"
+        f"{html.escape(v)}</button>"
+        for v in ["all", *values]
+    )
+    return f"<div class='chips'>{buttons}</div>"
+
+
+# Filtering is a class toggle, not a fetch: the lines are already on the page, and
+# re-reading the volume to hide half of them would be the slow way to do nothing.
+# A plain string, not an f-string, so the braces stay braces.
+FILTER_JS = """
+<script>
+document.querySelectorAll('.chip').forEach(chip => chip.addEventListener('click', () => {
+  const want = chip.dataset.filter;
+  document.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c === chip));
+  document.querySelectorAll('.line').forEach(line => {
+    line.classList.toggle('off', want !== 'all' && line.dataset.filter !== want);
+  });
+}));
+</script>
+"""
+
+
+def logs_page_html(run_id: str, lines: list[tuple[str, str, str, str]]) -> str:
+    """One run's merged log -- every call, both actors -- as its own page.
+
+    The ETL that built this run's data and the workers that trained on it are one
+    timeline here, which is the point: the two halves fail into each other, and a
+    worker aborting on a missing train.bin is only legible beside the build that
+    failed to produce it.
+    """
+    import html
+
+    shown = lines[-MAX_LOG_LINES:]
+
+    # A call writes one file, so it has exactly one actor.
+    actor_of = {call_id: actor for _, call_id, actor, _ in shown}
+    calls = list(dict.fromkeys(call_id for _, call_id, _, _ in shown))
+    colour = {c: CALL_COLOURS[i % len(CALL_COLOURS)] for i, c in enumerate(calls)}
+    actors = sorted({actor for _, _, actor, _ in shown})
 
     legend = " ".join(
-        f"<span class='att' style='color:{colour[c]}'>&#9679; {html.escape(c[-6:])}</span>" for c in workers
+        f"<span class='att' style='color:{colour[c]}'>&#9679; {html.escape(actor_of[c])} "
+        f"{html.escape(c[-6:])}</span>"
+        for c in calls
     )
 
-    if lines:
-        body = "".join(
-            f"<div class='line{' hi' if 'EXIT' in msg else ''}'>"
-            f"<span class='ts'>{html.escape(ts)}</span>"
-            f"<span class='att' style='color:{colour[call_id]}'>{html.escape(call_id[-6:])}</span>"
-            f"<span class='msg'>{html.escape(msg)}</span></div>"
-            for ts, call_id, msg in lines
-        )
-    else:
-        body = "<div class='empty'>No worker logs yet.</div>"
+    rows = [
+        {
+            "ts": ts,
+            "group": call_id,
+            "colour": colour[call_id],
+            "badge": call_id[-6:],
+            "tag": actor,
+            "message": msg,
+            "hi": "EXIT" in msg,
+            "filter": actor,
+        }
+        for ts, call_id, actor, msg in shown
+    ]
+    body = merged_lines_html(rows) if rows else "<div class='empty'>Nothing logged yet.</div>"
+    truncated = f" · showing last {len(shown):,}" if len(shown) < len(lines) else ""
+
+    # Straight to what Modal saw about this run's calls -- the container starts, the
+    # kills, and anything that happened before a logger existed to write it down.
+    traces = " ".join(
+        f"<a class='mono small' href='../trace/{html.escape(c)}'>{html.escape(actor_of[c])} {html.escape(c[-6:])}</a>"
+        for c in calls
+    )
 
     return f"""<!doctype html>
 <html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -422,13 +597,17 @@ def logs_page_html(run_id: str, lines: list[tuple[str, str, str]]) -> str:
 <body><main>
   <header>
     <h1 class='mono'>{html.escape(run_id)}</h1>
-    <span class='muted small'>{len(lines)} lines · {len(workers)} worker(s)</span>
+    <span class='muted small'>{len(lines):,} lines · {len(calls)} call(s){truncated}</span>
     <span class='muted small'>· <a href='../ledger/{html.escape(run_id)}'>ledger</a>
+                              · <a href='../sessions'>sessions</a>
                               · <a href='../'>all runs</a></span>
   </header>
+  {chips_html(actors)}
   <div class='legend'>{legend}</div>
   <div class='log'>{body}</div>
-</main></body></html>"""
+  <p class='muted small'>in Modal's own log: {traces or "—"}</p>
+</main>{FILTER_JS}
+</body></html>"""
 
 
 def ledger_page_html(run_id: str, lines: list[str]) -> str:
@@ -459,6 +638,162 @@ def ledger_page_html(run_id: str, lines: list[str]) -> str:
     <h1 class='mono'>{html.escape(run_id)}</h1>
     <span class='muted small'>{len(lines)} rows · train.jsonl</span>
     <span class='muted small'>· <a href='../logs/{html.escape(run_id)}'>logs</a>
+                              · <a href='../'>all runs</a></span>
+  </header>
+  <div class='log'>{body}</div>
+</main></body></html>"""
+
+
+# --------------------------------------------------------------------------------------
+# sessions: Modal's own view of the app, as applog captured it
+# --------------------------------------------------------------------------------------
+#
+# A different tree and a different question from everything above. The run pages
+# answer "what happened to this run", out of files our own code wrote into the
+# run's folder. These answer "what happened on this app", out of what Modal saw --
+# including the containers that died before they could write anything down.
+
+
+def human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB"):
+        if n < 1024 or unit == "MB":
+            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def session_rows(rows: list[dict]) -> list[dict]:
+    """Captured lines in the shape `merged_lines_html` draws.
+
+    Coloured by function rather than by call: on this page the question is which
+    part of the app spoke, and a session spans far too many calls for one colour
+    each to mean anything. Grouped by container, so a traceback out of one of them
+    stays one block even while another is logging into the same millisecond.
+    """
+    functions = list(dict.fromkeys(row["function"] for row in rows))
+    colour = {f: CALL_COLOURS[i % len(CALL_COLOURS)] for i, f in enumerate(functions)}
+    return [
+        {
+            "ts": row["ts"],
+            "group": row["task_id"],
+            "colour": colour[row["function"]],
+            "badge": row["function"],
+            "tag": row["task_id"][-6:],
+            "message": row["message"],
+            "hi": "EXIT" in row["message"],
+            "err": row["stderr"],
+            "filter": row["function"],
+        }
+        for row in rows
+    ]
+
+
+def sessions_page_html(sessions: list[dict]) -> str:
+    """Every capture session, newest first."""
+    import html
+
+    if not sessions:
+        body = (
+            "<tr><td colspan='5' class='empty'>No sessions yet — start one with "
+            "<span class='mono'>modal run launcher/app.py::watch</span></td></tr>"
+        )
+    else:
+        body = "".join(
+            f"""
+      <tr>
+        <td class='mono'><a href='sessions/{html.escape(s["session_id"])}'>{html.escape(s["session_id"])}</a></td>
+        <td class='mono small'>{html.escape((s.get("started") or "")[:19])}</td>
+        <td class='small'>{"<span class='st st-in_progress'>live</span>" if not s.get("ended")
+                           else html.escape(s.get("reason") or "ended")}</td>
+        <td class='mono small'>{s.get("lines", 0):,}</td>
+        <td class='mono small'>{human_bytes(s.get("bytes", 0))}</td>
+      </tr>"""
+            for s in sessions
+        )
+
+    return f"""<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Sessions</title>
+<style>{THEME_CSS}
+  table {{ width:100%; border-collapse:collapse; }}
+  th {{ text-align:left; font-size:.68rem; text-transform:uppercase; letter-spacing:.04em;
+        color:var(--muted); font-weight:600; padding:0 .75rem .5rem; border-bottom:1px solid var(--line); }}
+  td {{ padding:.3rem .75rem; border-bottom:1px solid var(--line); white-space:nowrap; }}
+  td:first-child, th:first-child {{ padding-left:0; }}
+  .empty {{ color:var(--muted); padding:2rem 0; text-align:center; }}
+  .st {{ font-weight:600; font-size:.78rem; }}
+  .st-in_progress {{ color:#9a6700; }}
+  @media (prefers-color-scheme: dark) {{ .st-in_progress {{ color:#d29922; }} }}
+</style></head>
+<body><main>
+  <header>
+    <h1>Sessions</h1>
+    <span class='muted small'>{len(sessions)} captured · <a href='./'>all runs</a></span>
+  </header>
+  <p class='muted small'>What Modal saw of the whole app, one file per capture session.
+     Everything <span class='mono'>modal app logs</span> would show, kept.</p>
+  <table>
+    <thead><tr><th>Session</th><th>Started</th><th>State</th><th>Lines</th><th>Size</th></tr></thead>
+    <tbody>{body}</tbody>
+  </table>
+</main></body></html>"""
+
+
+def session_page_html(session_id: str, meta: dict | None, rows: list[dict]) -> str:
+    """One session's captured log."""
+    import html
+
+    shown = rows[-MAX_LOG_LINES:]
+    functions = sorted({row["function"] for row in shown})
+    body = merged_lines_html(session_rows(shown)) if shown else "<div class='empty'>Nothing captured yet.</div>"
+    truncated = f" · showing last {len(shown):,}" if len(shown) < len(rows) else ""
+    state = "live" if meta and not meta.get("ended") else (meta or {}).get("reason", "—")
+
+    return f"""<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>{html.escape(session_id)} · session</title>
+<style>{THEME_CSS}{LOG_CSS}
+  main {{ max-width: 88rem; }}
+</style></head>
+<body><main>
+  <header>
+    <h1 class='mono'>{html.escape(session_id)}</h1>
+    <span class='muted small'>{len(rows):,} lines · {html.escape(str(state))}{truncated}</span>
+    <span class='muted small'>· <a href='../sessions'>all sessions</a>
+                              · <a href='../'>all runs</a></span>
+  </header>
+  <p class='muted small mono'>{html.escape((meta or {}).get("app_id", ""))}</p>
+  {chips_html(functions)}
+  <div class='log'>{body}</div>
+</main>{FILTER_JS}
+</body></html>"""
+
+
+def trace_page_html(call_id: str, rows: list[dict]) -> str:
+    """Everything Modal saw about one call, across every session.
+
+    The cross-link that pays for the whole collector: a run's log stops wherever
+    its container stopped being able to write, and this is where the rest of that
+    sentence is -- the OOM, the preemption, the traceback out of an import.
+    """
+    import html
+
+    shown = rows[-MAX_LOG_LINES:]
+    body = merged_lines_html(session_rows(shown)) if shown else (
+        "<div class='empty'>Nothing captured for this call — no session was running while it ran.</div>"
+    )
+    sessions = sorted({row.get("session_id", "") for row in shown})
+
+    return f"""<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>{html.escape(call_id)} · trace</title>
+<style>{THEME_CSS}{LOG_CSS}
+  main {{ max-width: 88rem; }}
+</style></head>
+<body><main>
+  <header>
+    <h1 class='mono'>{html.escape(call_id)}</h1>
+    <span class='muted small'>{len(rows):,} lines · {len(sessions)} session(s)</span>
+    <span class='muted small'>· <a href='../sessions'>all sessions</a>
                               · <a href='../'>all runs</a></span>
   </header>
   <div class='log'>{body}</div>
@@ -500,6 +835,29 @@ def build_web_app():
     async def ledger(run_id: str):
         """One run's train.jsonl, as written."""
         return HTMLResponse(ledger_page_html(run_id, await read_ledger(run_id)), headers=no_store)
+
+    @web.get("/sessions", response_class=HTMLResponse)
+    async def sessions():
+        """Every capture session applog has written to this volume."""
+        await volume.reload.aio()
+        return HTMLResponse(sessions_page_html(applog.list_sessions()), headers=no_store)
+
+    @web.get("/sessions/{session_id}", response_class=HTMLResponse)
+    async def session(session_id: str):
+        """One session's captured log -- Modal's whole view of the app for a window."""
+        await volume.reload.aio()
+        meta, rows = applog.read_session(session_id)
+        return HTMLResponse(session_page_html(session_id, meta, rows), headers=no_store)
+
+    @web.get("/trace/{call_id}", response_class=HTMLResponse)
+    async def trace(call_id: str):
+        """Everything Modal saw about one call, wherever it was captured.
+
+        The join between the two halves: `call_id` names a folder under a run and
+        column two of every captured line, so one id reaches both records.
+        """
+        await volume.reload.aio()
+        return HTMLResponse(trace_page_html(call_id, applog.trace_call(call_id)), headers=no_store)
 
     @web.post("/cancel/{run_id}")
     async def cancel(run_id: str):

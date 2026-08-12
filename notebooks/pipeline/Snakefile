@@ -5,8 +5,9 @@
                                v                       v
          encoders/{encoder_uid}/encoder.joblib -> encoders/{encoder_uid}/{source_uid}.bin
 
-Nothing here names an encoder or a split: the DAG is derived from run.yaml, so
-asking for a bin fits the encoder and fitting it downloads the sources it needs.
+Nothing here names an encoder or a split: the DAG is derived from the run's
+config.json, so asking for a bin fits the encoder and fitting it downloads the
+sources it needs.
 
 Every command needs `--config run_id=<run_id>` -- which request to build -- left
 off here for width:
@@ -33,10 +34,14 @@ encoder_uid is a hash of the encoder's definition (etl.encoder_uid), so the
 directory a bin sits in identifies what encoded it.
 
 Two config files at two levels: sources.yaml beside this file is the catalog of
-what a uid means, runs/{run_id}/run.yaml in the tree is what one run wants. So
-`--config volume=X run_id=Y` picks the tree and the request within it, and the
-catalog stays with the workflow. Flags come from profiles/default/config.yaml,
-found next to this file.
+what a uid means, runs/{run_id}/config.json in the tree is one whole run, of which
+this reads only the `encoder` and `sources` blocks. So `--config volume=X run_id=Y`
+picks the tree and the run within it, and the catalog stays with the workflow.
+Flags come from profiles/default/config.yaml, found next to this file.
+
+runs/{run_id}/run.yaml is an output, not an input: the request as this file
+resolved it, written back as a record. Nothing reads it, so it cannot drift from
+the config the way a hand-written copy could.
 
 Encoder kinds live in encoders.py -- nothing here knows what a bpe is.
 """
@@ -65,10 +70,11 @@ VOLUME = Path(config.get("volume", workflow.basedir))
 # built per run: data/ sits beside runs/, not inside one.
 DATA = VOLUME / "data"
 
-# Which run to build. Required, and deliberately not defaulted: every request
-# lives in its own folder, so guessing one would build somebody else's run.
-assert "run_id" in config, "pass --config run_id=<run_id>: whose run.yaml to build"
+# Which run to build. Required, and deliberately not defaulted: every run lives in
+# its own folder, so guessing one would build somebody else's run.
+assert "run_id" in config, "pass --config run_id=<run_id>: whose config.json to build"
 RUN_ID = config["run_id"]
+RDIR = etl.run_dir(VOLUME, RUN_ID)
 
 # The catalog, into the global `config`. From WORKFLOW, not DATA, so an empty
 # volume still knows what a source uid means.
@@ -77,9 +83,10 @@ configfile: str(WORKFLOW / etl.CATALOG_FILE)
 # uid -> {urls, tags}: what exists, not what this run wants.
 CATALOG = config["sources"]
 
-# The request, read with plain yaml -- its `sources` key would collide with the
-# catalog's in the one flat `config` dict.
-RUN = etl.read_spec(etl.run_dir(VOLUME, RUN_ID))
+# The request, from the run's own config.json -- read with plain json, since its
+# `sources` key would collide with the catalog's in the one flat `config` dict.
+# Needed here, at parse time, because the DAG below is derived from it.
+RUN = etl.read_request(RDIR)
 etl.validate(RUN, CATALOG)
 
 ENCODER = RUN["encoder"]
@@ -88,7 +95,7 @@ TRAIN = RUN["sources"]["train_sources"]
 VALID = RUN["sources"]["valid_sources"]
 
 # Every catalog uid becomes a rule name below, so one of these would shadow a target.
-shadowed = sorted({"all", "encoder", "train", "valid"} & set(CATALOG))
+shadowed = sorted({"all", "encoder", "train", "valid", "run_spec"} & set(CATALOG))
 assert not shadowed, f"source uid shadows a workflow target: {shadowed}"
 
 # Sources are joined by EOS, not a newline, so the encoder sees a boundary.
@@ -127,6 +134,21 @@ rule all:
         str(etl.encoder_artifact(DATA, UID)),
         str(etl.encoder_config(DATA, UID)),
         run_bins(TRAIN + VALID),
+        str(RDIR / etl.RUN_FILE),
+
+
+# The request as resolved above, written back beside the config it came from. A
+# record: it is an output because it is derived, and nothing downstream reads it.
+# RUN is already in hand from parse time -- this rule only puts it on disk, so
+# editing config.json for a reason that has nothing to do with the ETL (bumping
+# total_steps) rewrites this leaf and nothing else.
+rule run_spec:
+    input:
+        str(RDIR / etl.CONFIG_FILE),
+    output:
+        str(RDIR / etl.RUN_FILE),
+    run:
+        etl.write_spec(RUN, RDIR)
 
 
 # Fetch one source. No file inputs -- its raw material is the catalog, so this is

@@ -1,0 +1,26 @@
+# sources.yaml -- the source catalog: what a source uid means. Nothing else.
+#
+# This is the registry of what can be ingested, and it is all that is
+# hand-maintained here. It sits beside the Snakefile rather than in data/
+# because it describes the pipeline, not any one tree: point --config volume at
+# an empty directory and a uid still means the same thing.
+#
+# What gets built out of it -- which encoder, over which of these sources, split
+# how -- comes from the config in etl_train_pipeline.ipynb, which lands in
+# data/run.yaml. Adding a source here builds nothing until a run asks for it.
+#
+# Tags are namespaced key:value. A key may repeat (two genre: tags is fine);
+# they are unused until tag-predicate splits land.
+#
+# A source is the smallest splittable unit, so validation holds out whole
+# sources: one book per uid keeps that choice open.
+
+sources:
+  montecristo: {urls: [https://gutenberg.org/cache/epub/1184/pg1184.txt],
+                tags: [source:gutenberg, lang:en, genre:fiction, author:dumas]}
+  romeojuliet: {urls: [https://gutenberg.org/cache/epub/1513/pg1513.txt],
+                tags: [source:gutenberg, lang:en, genre:drama, author:shakespeare]}
+  odyssey:     {urls: [https://gutenberg.org/cache/epub/1727/pg1727.txt],
+                tags: [source:gutenberg, lang:en, genre:fiction, author:homer]}
+  mobydick:    {urls: [https://www.gutenberg.org/cache/epub/2701/pg2701.txt],
+                tags: [source:gutenberg, lang:en, genre:fiction, author:melville]}

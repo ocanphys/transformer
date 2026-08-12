@@ -10,3 +10,9 @@
 scheduler: greedy
 
 cores: 4
+
+# Every trigger but `code`. Artifacts here are write-once, so editing a rule's
+# body must not ask to rewrite one -- that request would only ever come back as
+# a ProtectedOutputException. Changing how encoding works means deleting what it
+# produced, deliberately.
+rerun-triggers: [mtime, input, params, software-env]
