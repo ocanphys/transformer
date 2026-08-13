@@ -99,15 +99,12 @@ LOCAL_MODULES = ("jobs", "logs")
 image = base_image.add_local_python_source(*LOCAL_MODULES)
 
 # The dashboard needs a web server, and its own module shipped alongside this one.
-# applog rides along because the sessions view reads the file format that module
-# defines -- reading it needs none of its Modal machinery, only its parser.
+# applog rides along because the dashboard is the only thing that calls it: it asks
+# Modal for this app's own logs on demand and renders them, so there is no
+# collector, no second container, and nothing stored.
 web_image = base_image.pip_install("fastapi[standard]").add_local_python_source(
     *LOCAL_MODULES, "applog", "dashboard"
 )
-
-# The collector needs nothing a Modal container does not already have: the client
-# library is injected into every one of them, and everything it calls is in there.
-collector_image = base_image.add_local_python_source(*LOCAL_MODULES, "applog")
 
 # The ETL needs the real project environment: uv_sync installs the lockfile's deps
 # (snakemake, joblib, ...) and `transformer` rides along because the Snakefile
@@ -518,6 +515,17 @@ JOB = Train
 # built with, so a UI change can take up to a minute to appear. When iterating on
 # the page, drop this to 2 (Modal's floor) to see changes within ~6s.
 @app.function(image=web_image, volumes={"/storage": volume}, timeout=60, scaledown_window=60)
+# One container, many requests. Without this a container serves a single input at a
+# time, so a poll that overlaps the previous one can only be answered by starting
+# another container -- which cold-starts, which is slow, which causes more overlap.
+# Measured before adding it: 1,639 requests spread over **89 containers**, with
+# `/rows` at p50 538ms, p90 1.5s, and 61 requests slower than the 3s poll interval.
+#
+# Everything here waits on the network -- a volume reload, Modal's liveness calls,
+# a log fetch -- so one container can hold many of them at once for free. `def`
+# handlers still go to FastAPI's threadpool, which is why applog takes a lock
+# around its archive writes.
+@modal.concurrent(max_inputs=50)
 @modal.asgi_app()
 def dashboard():
     """Serve the run list. All the drawing lives in dashboard.py.
@@ -529,60 +537,6 @@ def dashboard():
     from dashboard import build_web_app
 
     return build_web_app()
-
-
-# --------------------------------------------------------------------------------------
-# the collector: Modal's own view of this app, onto the Volume
-# --------------------------------------------------------------------------------------
-
-COLLECT_HOURS = 6.0  # how long one session runs before closing itself cleanly
-
-
-@app.function(
-    image=collector_image,
-    volumes={STORAGE: volume},
-    # Comfortably longer than the session, so the deadline inside `capture` is
-    # always what ends it: a container killed by Modal's timeout instead would
-    # leave the session's sidecar without its closing line.
-    timeout=int(COLLECT_HOURS * 3600) + 600,
-    max_containers=1,
-    retries=0,
-)
-def collect(hours: float = COLLECT_HOURS, resume: bool = True) -> dict:
-    """Capture this app's own logs into launcher_logs/, one file per session.
-
-    Everything `modal app logs training-launcher` would show, made durable and
-    attributed: each line carries the function, container and call it came from.
-    That is the half of the story the run tree cannot hold -- a crash before a
-    worker's logger exists, an OOM after it is gone, `print()`, library warnings,
-    and `launch` and `dashboard`, which write no run-tree log at all.
-
-    Started explicitly, and that is a decision rather than an omission: a session
-    is one run of this function, so capture costs nothing when nobody is working,
-    and a gap between two sessions is a fact recorded in the index rather than
-    something the design pretends away.
-
-        modal run launcher/app.py::watch
-
-    `max_containers=1` is what stops two collectors writing the same tree and
-    duplicating every line. The price is that a second call *queues* behind the
-    first rather than being refused, so it starts whenever the running session
-    ends -- check for a live one before starting another.
-
-    All the machinery is in applog.py, which shares nothing with logs.py: this
-    writes what Modal saw, that writes what our own code said, and keeping them
-    apart is why neither can quietly become the other.
-    """
-    # First, and before applog opens a file on this mount: a reload refuses while
-    # any file under it is open, and the previous session's cursor is read off the
-    # volume. Containers are reused, so the snapshot is stale by default.
-    volume.reload()
-
-    # Imported here, not at module level: this module is imported by every
-    # container in the app and only the collector's image ships applog.
-    import applog
-
-    return applog.capture(volume, APP_NAME, hours=hours, resume=resume)
 
 
 # --------------------------------------------------------------------------------------
@@ -801,25 +755,6 @@ def main(run_id: str):
     """
     launcher = modal.Function.from_name(APP_NAME, "launch")
     print(launcher.remote(run_id=run_id))
-
-
-@app.local_entrypoint()
-def watch(hours: float = COLLECT_HOURS):
-    """Open a capture session on the deployed app, and return.
-
-        modal run launcher/app.py::watch
-        modal run launcher/app.py::watch --hours 1
-
-    `spawn`, not `remote`: the session runs for hours and nothing here wants to
-    wait for it. Through the deployed app for the usual reason -- a `modal run` of
-    this module gets its own container pool, so a locally-constructed collector
-    would not serialize against the deployed one and both would capture the same
-    lines into two different files.
-    """
-    collector = modal.Function.from_name(APP_NAME, "collect")
-    call = collector.spawn(hours=hours)
-    print(f"collecting {APP_NAME} for {hours}h -- call {call.object_id}")
-    print(f"  modal volume ls {VOLUME_NAME} launcher_logs")
 
 
 @app.local_entrypoint()

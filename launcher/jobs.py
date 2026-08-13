@@ -77,11 +77,11 @@ from pathlib import Path
 VOLUME = Path("/storage")
 RUNS = VOLUME / "runs"
 
-# Modal's own view of the app -- every container's stdout and stderr, plus the
-# lifecycle events no container is around to write down -- captured per session by
-# launcher/applog.py. A sibling of runs/, not a child of one: a session spans every
-# run alive during it and belongs to none of them.
-LAUNCHER_LOGS = VOLUME / "launcher_logs"
+# Modal's own view of the app, archived as it is read. One file per (UTC day, app
+# record) -- `{YYYYMMDD}_{app_id}` -- because logs are keyed to an app record and a
+# record's id changes whenever the app is stopped and redeployed. A sibling of
+# runs/, not a child of one: a day spans every run alive during it.
+MODAL_LOGS = VOLUME / "modal_logs"
 
 
 class Aborted(Exception):

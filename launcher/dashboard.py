@@ -300,8 +300,7 @@ def rows_html(runs: list[dict]) -> str:
         # the element so the script never has to know the status vocabulary.
         if status_key in CANCELLABLE:
             action = (
-                f"<button class='cancel' data-act='cancel' data-busy='Cancelling…' "
-                f"data-run='{name}'>Cancel</button>"
+                f"<button class='cancel' data-act='cancel' data-busy='Cancelling…' data-run='{name}'>Cancel</button>"
             )
         elif status_key in RESUMABLE:
             # One route and one call: `launch` does not distinguish starting a run
@@ -309,10 +308,7 @@ def rows_html(runs: list[dict]) -> str:
             # its lock, on evidence this page is too far away to have. Only the word
             # differs, because to someone reading the row they are different events.
             verb, busy = ("Start", "Starting…") if status_key == "new" else ("Resume", "Resuming…")
-            action = (
-                f"<button class='resume' data-act='resume' data-busy='{busy}' "
-                f"data-run='{name}'>{verb}</button>"
-            )
+            action = f"<button class='resume' data-act='resume' data-busy='{busy}' data-run='{name}'>{verb}</button>"
         else:
             action = ""
 
@@ -404,7 +400,7 @@ def page_html(runs: list[dict]) -> str:
   <header>
     <h1>Runs</h1>
     <span class='muted small' id='meta'>{len(runs)} runs</span>
-    <span class='muted small'>· <a href='sessions'>sessions</a></span>
+    <span class='muted small'>· <a href='modal'>modal logs</a></span>
   </header>
   <table>
     <thead><tr><th>Run</th><th>Status</th><th>Progress</th><th>Attempt</th><th></th></tr></thead>
@@ -446,32 +442,45 @@ setInterval(refresh, {REFRESH_MS});
 CALL_COLOURS = ["#0969da", "#8250df", "#bf8700", "#1a7f37", "#cf222e", "#0f766e"]
 
 
+# Every column is a fixed width. Not cosmetic: with `flex:0 0 auto` the badge grew
+# with its text, so a `dashboard` line and an `etl` line started their messages at
+# different columns and a scrolling log read as a zigzag. Widths are in `ch`, which
+# in a monospace face is exactly one character.
 LOG_CSS = """
   .log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;
          border-top:1px solid var(--line); }
-  .line { display:flex; gap:1rem; padding:.18rem 0; border-bottom:1px solid var(--line); }
+  .line { display:flex; gap:.75rem; padding:.08rem 0; border-bottom:1px solid var(--line); }
   .line:hover { background:color-mix(in srgb, var(--fg) 5%, transparent); }
   .line.hi .msg { font-weight:600; }
   .line.off { display:none; }
   /* the last line of a same-instant burst keeps the rule; the ones above it drop
      it, so a traceback reads as one block instead of a stack of framed rows */
   .line.nb { border-bottom:none; }
-  /* fixed width, because a continuation line leaves it empty and the columns
-     still have to line up under the timestamp they belong to */
-  .ts { color:var(--muted); flex:0 0 24ch; }
+  /* column headings, kept in view while a long log scrolls under them */
+  .line.head { position:sticky; top:0; background:var(--bg); color:var(--muted);
+               font-size:.66rem; text-transform:uppercase; letter-spacing:.05em; font-weight:600;
+               padding:.2rem 0; border-bottom:1px solid var(--line); }
+  .line.head:hover { background:var(--bg); }
+  /* fixed, because a continuation line leaves it empty and the columns still have
+     to line up under the timestamp they belong to */
+  .ts { color:var(--muted); flex:0 0 19ch; }
   .num { color:var(--muted); flex:0 0 3rem; text-align:right; }
-  .att { flex:0 0 auto; font-weight:600; font-size:.72rem; letter-spacing:.02em; }
-  .actor { flex:0 0 3.2rem; color:var(--muted); font-size:.72rem; }
+  .att { flex:0 0 10ch; font-weight:600; font-size:.72rem; letter-spacing:.02em;
+         overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .actor { flex:0 0 7ch; color:var(--muted); font-size:.72rem;
+           overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .msg { white-space:pre-wrap; word-break:break-word; }
   .msg.err { color:#cf222e; }
   @media (prefers-color-scheme: dark) { .msg.err { color:#f85149; } }
   .empty { color:var(--muted); padding:2rem 0; }
   .legend { display:flex; gap:.9rem; margin-bottom:.8rem; font-size:.72rem; }
-  .chips { display:flex; gap:.4rem; margin-bottom:.8rem; }
+  .chips { display:flex; gap:.4rem; margin-bottom:.8rem; align-items:center; flex-wrap:wrap; }
   .chip { font:inherit; font-size:.72rem; padding:.1rem .55rem; border-radius:999px; cursor:pointer;
           border:1px solid var(--line); background:transparent; color:var(--muted); }
   .chip:hover { border-color:var(--accent); }
   .chip.on { color:var(--accent); border-color:var(--accent); }
+  label.chip { display:inline-flex; gap:.35rem; align-items:center; }
+  label.chip input { margin:0; }
 """
 
 
@@ -493,22 +502,72 @@ def merged_lines_html(rows: list[dict]) -> str:
     """
     import html
 
+    def ident(row: dict) -> tuple:
+        """What makes two lines the same speaker.
+
+        `filter` and `poll` are in here even though they are not drawn, because
+        both can be hidden independently: if a poll line and an ordinary one could
+        continue each other, hiding the polls would leave a visible line whose
+        identity was blanked against a predecessor that is no longer on screen.
+        """
+        return (row["badge"], row.get("tag", ""), row.get("filter", ""), bool(row.get("poll")))
+
     out = []
     for i, row in enumerate(rows):
         key = (row["ts"], row["group"])
         continues = i > 0 and (rows[i - 1]["ts"], rows[i - 1]["group"]) == key
         continued = i + 1 < len(rows) and (rows[i + 1]["ts"], rows[i + 1]["group"]) == key
+        # Said once per run of lines, not once per line: a hundred snakemake lines
+        # from one ETL call do not need the call id a hundred times, and the
+        # repetition is what buries the messages.
+        same_speaker = i > 0 and ident(rows[i - 1]) == ident(row)
 
         classes = "line" + (" hi" if row.get("hi") else "") + (" nb" if continued else "")
+        # An optional link on the tag, which is how a line gets a way out of the
+        # page it is on -- from Modal's view into one call's trace, say. It sits on
+        # the first line of a run, which is the one that still draws the tag.
+        tag = "" if same_speaker else html.escape(row.get("tag", ""))
+        if row.get("href") and tag:
+            tag = f"<a href='{html.escape(row['href'])}'>{tag}</a>"
+        badge = "" if same_speaker else html.escape(row["badge"])
+
+        # Rendered UTC, converted to local by the browser -- see LOG_JS. The short
+        # form is written server-side so the column is already the right width
+        # before any script runs, and `data-ts` carries the full instant for the
+        # conversion. Continuation lines get neither: their cell stays empty.
+        stamp = "" if continues else f"<span class='ts' data-ts='{html.escape(row['ts'])}'>{short_ts(row['ts'])}</span>"
+
         out.append(
-            f"<div class='{classes}' data-filter='{html.escape(row.get('filter', ''))}'>"
-            f"<span class='ts'>{'' if continues else html.escape(row['ts'])}</span>"
-            f"<span class='att' style='color:{row['colour']}'>{html.escape(row['badge'])}</span>"
-            f"<span class='actor'>{html.escape(row.get('tag', ''))}</span>"
+            f"<div class='{classes}' data-filter='{html.escape(row.get('filter', ''))}'"
+            f"{' data-poll=1' if row.get('poll') else ''}>"
+            f"{stamp or "<span class='ts'></span>"}"
+            f"<span class='att' style='color:{row['colour']}'>{badge}</span>"
+            f"<span class='actor'>{tag}</span>"
             f"<span class='msg{' err' if row.get('err') else ''}'>{html.escape(row['message'])}</span>"
             "</div>"
         )
     return "".join(out)
+
+
+def short_ts(ts: str) -> str:
+    """`2026-08-13T03:47:48.868Z` -> `08/13 03:47:48.868`.
+
+    The year is never in question in a log you are reading now, and dropping it
+    buys five characters of message width on every line. Still UTC at this point;
+    LOG_JS rewrites it to local, in this same shape.
+    """
+    return f"{ts[5:7]}/{ts[8:10]} {ts[11:23]}" if len(ts) >= 23 else ts
+
+
+def log_header_html(badge: str, tag: str) -> str:
+    """A heading row using the same columns as the lines below it."""
+    return (
+        "<div class='line head'>"
+        "<span class='ts'>Time</span>"
+        f"<span class='att'>{badge}</span>"
+        f"<span class='actor'>{tag}</span>"
+        "<span class='msg'>Message</span></div>"
+    )
 
 
 def chips_html(values: list[str]) -> str:
@@ -518,25 +577,58 @@ def chips_html(values: list[str]) -> str:
     if len(values) < 2:
         return ""
     buttons = "".join(
-        f"<button class='chip{' on' if v == 'all' else ''}' data-filter='{html.escape(v)}'>"
-        f"{html.escape(v)}</button>"
+        f"<button class='chip{' on' if v == 'all' else ''}' data-filter='{html.escape(v)}'>{html.escape(v)}</button>"
         for v in ["all", *values]
     )
     return f"<div class='chips'>{buttons}</div>"
 
 
-# Filtering is a class toggle, not a fetch: the lines are already on the page, and
-# re-reading the volume to hide half of them would be the slow way to do nothing.
-# A plain string, not an f-string, so the braces stay braces.
-FILTER_JS = """
+# Everything the log pages do client-side. Filtering and hiding are class toggles
+# rather than fetches: the lines are already on the page, and re-reading the volume
+# to show fewer of them would be the slow way to do nothing.
+#
+# A plain string, not an f-string, so the braces stay braces. Each behaviour is
+# guarded on its own elements, so pages that lack a control simply skip it.
+LOG_JS = """
 <script>
-document.querySelectorAll('.chip').forEach(chip => chip.addEventListener('click', () => {
+// Timestamps are stored and rendered in UTC -- one fixed format is what lets logs
+// from different files be merged by sorting strings. Only the reader wants local
+// time, and only the reader knows what local is, so the conversion happens here.
+document.querySelectorAll('.ts[data-ts]').forEach(el => {
+  const d = new Date(el.dataset.ts);
+  if (isNaN(d)) return;
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  el.textContent = `${p(d.getMonth() + 1)}/${p(d.getDate())} ` +
+                   `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+});
+
+document.querySelectorAll('.chip[data-filter]').forEach(chip => chip.addEventListener('click', () => {
   const want = chip.dataset.filter;
-  document.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c === chip));
+  document.querySelectorAll('.chip[data-filter]').forEach(c => c.classList.toggle('on', c === chip));
   document.querySelectorAll('.line').forEach(line => {
+    if (line.classList.contains('head')) return;
     line.classList.toggle('off', want !== 'all' && line.dataset.filter !== want);
   });
 }));
+
+// The dashboard polls itself every few seconds, so on a quiet app its own request
+// log is most of what there is to read -- hidden by default, and one click away
+// when the question is about the dashboard itself. The visible count is kept
+// honest, or the header would claim thousands of lines you cannot see.
+const polls = document.getElementById('hide-polls');
+if (polls) {
+  const apply = () => {
+    document.querySelectorAll('.line[data-poll]').forEach(
+      line => line.classList.toggle('off', polls.checked));
+    const count = document.getElementById('linecount');
+    if (count) {
+      const shown = document.querySelectorAll('.line:not(.head):not(.off)').length;
+      count.textContent = shown.toLocaleString();
+    }
+  };
+  polls.addEventListener('change', apply);
+  apply();
+}
 </script>
 """
 
@@ -560,8 +652,7 @@ def logs_page_html(run_id: str, lines: list[tuple[str, str, str, str]]) -> str:
     actors = sorted({actor for _, _, actor, _ in shown})
 
     legend = " ".join(
-        f"<span class='att' style='color:{colour[c]}'>&#9679; {html.escape(actor_of[c])} "
-        f"{html.escape(c[-6:])}</span>"
+        f"<span class='att' style='color:{colour[c]}'>&#9679; {html.escape(actor_of[c])} {html.escape(c[-6:])}</span>"
         for c in calls
     )
 
@@ -578,7 +669,11 @@ def logs_page_html(run_id: str, lines: list[tuple[str, str, str, str]]) -> str:
         }
         for ts, call_id, actor, msg in shown
     ]
-    body = merged_lines_html(rows) if rows else "<div class='empty'>Nothing logged yet.</div>"
+    body = (
+        log_header_html("Call", "Actor") + merged_lines_html(rows)
+        if rows
+        else "<div class='empty'>Nothing logged yet.</div>"
+    )
     truncated = f" · showing last {len(shown):,}" if len(shown) < len(lines) else ""
 
     # Straight to what Modal saw about this run's calls -- the container starts, the
@@ -599,14 +694,14 @@ def logs_page_html(run_id: str, lines: list[tuple[str, str, str, str]]) -> str:
     <h1 class='mono'>{html.escape(run_id)}</h1>
     <span class='muted small'>{len(lines):,} lines · {len(calls)} call(s){truncated}</span>
     <span class='muted small'>· <a href='../ledger/{html.escape(run_id)}'>ledger</a>
-                              · <a href='../sessions'>sessions</a>
+                              · <a href='../modal'>modal logs</a>
                               · <a href='../'>all runs</a></span>
   </header>
   {chips_html(actors)}
   <div class='legend'>{legend}</div>
   <div class='log'>{body}</div>
   <p class='muted small'>in Modal's own log: {traces or "—"}</p>
-</main>{FILTER_JS}
+</main>{LOG_JS}
 </body></html>"""
 
 
@@ -645,29 +740,33 @@ def ledger_page_html(run_id: str, lines: list[str]) -> str:
 
 
 # --------------------------------------------------------------------------------------
-# sessions: Modal's own view of the app, as applog captured it
+# Modal's own view of the app, asked for when someone opens the page
 # --------------------------------------------------------------------------------------
 #
-# A different tree and a different question from everything above. The run pages
-# answer "what happened to this run", out of files our own code wrote into the
-# run's folder. These answer "what happened on this app", out of what Modal saw --
-# including the containers that died before they could write anything down.
+# A different question from everything above. The run pages answer "what happened
+# to this run", out of files our own code wrote into the run's folder. These answer
+# "what happened on this app", out of what Modal saw -- including the containers
+# that died before they could write anything down.
+#
+# Nothing here is stored. Modal keeps these logs already, `applog.fetch` asks for
+# them, and the answer is rendered and thrown away. There is no collector and no
+# second container: this one serves the page and makes the call.
+
+MODAL_HOURS = 2.0  # default range for the app-wide view
+TRACE_HOURS = 24 * 7  # a call is looked up long after it ran, so reach back further
 
 
-def human_bytes(n: int) -> str:
-    for unit in ("B", "KB", "MB"):
-        if n < 1024 or unit == "MB":
-            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
+def modal_rows(rows: list[dict], link: bool = True) -> list[dict]:
+    """`applog.fetch` rows in the shape `merged_lines_html` draws.
 
+    Coloured by function rather than by call: the question on this page is which
+    part of the app spoke, and a busy window holds far too many calls for one
+    colour each to mean anything. Grouped by container, so a traceback out of one
+    stays a single block even while another logs into the same millisecond.
 
-def session_rows(rows: list[dict]) -> list[dict]:
-    """Captured lines in the shape `merged_lines_html` draws.
-
-    Coloured by function rather than by call: on this page the question is which
-    part of the app spoke, and a session spans far too many calls for one colour
-    each to mean anything. Grouped by container, so a traceback out of one of them
-    stays one block even while another is logging into the same millisecond.
+    `link=False` for the trace page: its links are relative to `/trace/{call_id}`,
+    where another `trace/…` would nest, and every line there is already the call
+    being looked at.
     """
     functions = list(dict.fromkeys(row["function"] for row in rows))
     colour = {f: CALL_COLOURS[i % len(CALL_COLOURS)] for i, f in enumerate(functions)}
@@ -677,111 +776,122 @@ def session_rows(rows: list[dict]) -> list[dict]:
             "group": row["task_id"],
             "colour": colour[row["function"]],
             "badge": row["function"],
-            "tag": row["task_id"][-6:],
+            # The call when there is one, falling back to the container. System
+            # lines -- container lifecycle, the web server's own request log --
+            # carry no call id, and only the call is worth a link: it is the id
+            # that also names a folder under `runs/`.
+            "tag": (row["call_id"] or row["task_id"])[-6:],
+            "href": f"trace/{row['call_id']}" if (link and row["call_id"]) else "",
             "message": row["message"],
             "hi": "EXIT" in row["message"],
             "err": row["stderr"],
             "filter": row["function"],
+            # The dashboard polling itself. Marked rather than dropped, so the page
+            # can hide it without the server deciding what is worth keeping.
+            "poll": row["function"] == "dashboard" and "GET /rows" in row["message"],
         }
         for row in rows
     ]
 
 
-def sessions_page_html(sessions: list[dict]) -> str:
-    """Every capture session, newest first."""
-    import html
-
-    if not sessions:
-        body = (
-            "<tr><td colspan='5' class='empty'>No sessions yet — start one with "
-            "<span class='mono'>modal run launcher/app.py::watch</span></td></tr>"
-        )
-    else:
-        body = "".join(
-            f"""
-      <tr>
-        <td class='mono'><a href='sessions/{html.escape(s["session_id"])}'>{html.escape(s["session_id"])}</a></td>
-        <td class='mono small'>{html.escape((s.get("started") or "")[:19])}</td>
-        <td class='small'>{"<span class='st st-in_progress'>live</span>" if not s.get("ended")
-                           else html.escape(s.get("reason") or "ended")}</td>
-        <td class='mono small'>{s.get("lines", 0):,}</td>
-        <td class='mono small'>{human_bytes(s.get("bytes", 0))}</td>
-      </tr>"""
-            for s in sessions
-        )
-
-    return f"""<!doctype html>
-<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Sessions</title>
-<style>{THEME_CSS}
-  table {{ width:100%; border-collapse:collapse; }}
-  th {{ text-align:left; font-size:.68rem; text-transform:uppercase; letter-spacing:.04em;
-        color:var(--muted); font-weight:600; padding:0 .75rem .5rem; border-bottom:1px solid var(--line); }}
-  td {{ padding:.3rem .75rem; border-bottom:1px solid var(--line); white-space:nowrap; }}
-  td:first-child, th:first-child {{ padding-left:0; }}
-  .empty {{ color:var(--muted); padding:2rem 0; text-align:center; }}
-  .st {{ font-weight:600; font-size:.78rem; }}
-  .st-in_progress {{ color:#9a6700; }}
-  @media (prefers-color-scheme: dark) {{ .st-in_progress {{ color:#d29922; }} }}
-</style></head>
-<body><main>
-  <header>
-    <h1>Sessions</h1>
-    <span class='muted small'>{len(sessions)} captured · <a href='./'>all runs</a></span>
-  </header>
-  <p class='muted small'>What Modal saw of the whole app, one file per capture session.
-     Everything <span class='mono'>modal app logs</span> would show, kept.</p>
-  <table>
-    <thead><tr><th>Session</th><th>Started</th><th>State</th><th>Lines</th><th>Size</th></tr></thead>
-    <tbody>{body}</tbody>
-  </table>
-</main></body></html>"""
+# The long end reaches past what Modal will serve: a fetch is clamped to 35 days,
+# but `applog.load` is not, so the wider ranges answer from the archive alone.
+RANGES = [("30m", 0.5), ("2h", 2.0), ("12h", 12.0), ("2d", 48.0), ("7d", 168.0), ("30d", 720.0)]
 
 
-def session_page_html(session_id: str, meta: dict | None, rows: list[dict]) -> str:
-    """One session's captured log."""
-    import html
+def modal_page_html(rows: list[dict], hours: float, search: str, app: str = "") -> str:
+    """The app-wide view: what Modal saw, over a window, fetched just now.
 
-    shown = rows[-MAX_LOG_LINES:]
-    functions = sorted({row["function"] for row in shown})
-    body = merged_lines_html(session_rows(shown)) if shown else "<div class='empty'>Nothing captured yet.</div>"
-    truncated = f" · showing last {len(shown):,}" if len(shown) < len(rows) else ""
-    state = "live" if meta and not meta.get("ended") else (meta or {}).get("reason", "—")
-
-    return f"""<!doctype html>
-<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>{html.escape(session_id)} · session</title>
-<style>{THEME_CSS}{LOG_CSS}
-  main {{ max-width: 88rem; }}
-</style></head>
-<body><main>
-  <header>
-    <h1 class='mono'>{html.escape(session_id)}</h1>
-    <span class='muted small'>{len(rows):,} lines · {html.escape(str(state))}{truncated}</span>
-    <span class='muted small'>· <a href='../sessions'>all sessions</a>
-                              · <a href='../'>all runs</a></span>
-  </header>
-  <p class='muted small mono'>{html.escape((meta or {}).get("app_id", ""))}</p>
-  {chips_html(functions)}
-  <div class='log'>{body}</div>
-</main>{FILTER_JS}
-</body></html>"""
-
-
-def trace_page_html(call_id: str, rows: list[dict]) -> str:
-    """Everything Modal saw about one call, across every session.
-
-    The cross-link that pays for the whole collector: a run's log stops wherever
-    its container stopped being able to write, and this is where the rest of that
-    sentence is -- the OOM, the preemption, the traceback out of an import.
+    The range buttons are plain links rather than a filter, because the range is
+    the one thing the browser cannot narrow on its own -- widening it is another
+    request to Modal, and a cheap one. The function chips are client-side, since
+    those lines are already on the page.
     """
     import html
 
     shown = rows[-MAX_LOG_LINES:]
-    body = merged_lines_html(session_rows(shown)) if shown else (
-        "<div class='empty'>Nothing captured for this call — no session was running while it ran.</div>"
+    functions = sorted({row["function"] for row in shown})
+    body = (
+        log_header_html("Function", "Call") + merged_lines_html(modal_rows(shown))
+        if shown
+        else "<div class='empty'>Nothing in this window.</div>"
     )
-    sessions = sorted({row.get("session_id", "") for row in shown})
+    truncated = f" · showing last {len(shown):,}" if len(shown) < len(rows) else ""
+    polls = sum(1 for row in shown if row["function"] == "dashboard" and "GET /rows" in row["message"])
+
+    # Carried through every range link, or changing the window would silently drop
+    # the search and the app you are looking at.
+    carried = ("&q=" + html.escape(search, quote=True) if search else "") + (
+        "&app=" + html.escape(app, quote=True) if app else ""
+    )
+    picker = " ".join(
+        f"<a class='chip{' on' if abs(value - hours) < 1e-6 else ''}' href='?hours={value:g}{carried}'>{label}</a>"
+        for label, value in RANGES
+    )
+    q = html.escape(search, quote=True)
+    pinned = (
+        f" · pinned to <span class='mono'>{html.escape(app)}</span> · <a href='?hours={hours:g}'>all records</a>"
+        if app
+        else ""
+    )
+
+    return f"""<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Modal · logs</title>
+<style>{THEME_CSS}{LOG_CSS}
+  main {{ max-width: 88rem; }}
+  a.chip {{ text-decoration:none; }}
+  form.q {{ display:inline-flex; gap:.4rem; margin-left:.5rem; }}
+  form.q input {{ font:inherit; font-size:.72rem; padding:.1rem .5rem; border-radius:999px;
+                  border:1px solid var(--line); background:transparent; color:var(--fg); }}
+</style></head>
+<body><main>
+  <header>
+    <h1>Modal logs</h1>
+    <span class='muted small'><span id='linecount'>{len(rows):,}</span> lines
+      · last {hours:g}h{truncated}{pinned}</span>
+    <span class='muted small'>· <a href='./'>all runs</a></span>
+  </header>
+  <p class='muted small'>Everything <span class='mono'>modal app logs {html.escape(APP_NAME)}</span>
+     would show, asked for when you opened this page and archived to
+     <span class='mono'>modal_logs/</span> on the way past — so the window can reach back further
+     than Modal will still answer for. Add <span class='mono'>?app=ap-…</span> to pull in a record
+     it has forgotten.</p>
+  <div class='chips'>{picker}
+    <form class='q' method='get'>
+      <input type='hidden' name='hours' value='{hours:g}'>
+      <input type='hidden' name='app' value='{html.escape(app, quote=True)}'>
+      <input type='search' name='q' value='{q}' placeholder='search…'>
+    </form>
+    <label class='chip' title='The dashboard polling itself every {REFRESH_MS // 1000}s'>
+      <input type='checkbox' id='hide-polls' checked> hide {polls:,} dashboard polls</label>
+  </div>
+  {chips_html(functions)}
+  <div class='log'>{body}</div>
+</main>{LOG_JS}
+</body></html>"""
+
+
+def trace_page_html(call_id: str, rows: list[dict]) -> str:
+    """Everything Modal saw about one call.
+
+    The join, and the reason any of this is worth having: a run's own log stops
+    wherever its container stopped being able to write, and this is the rest of
+    that sentence -- the OOM, the preemption, the traceback out of an import that
+    happened before a logger existed.
+
+    Filtered by Modal, not here. `fc-` is a first-class filter on the fetch, so
+    this asks a narrow question and gets a small answer, however busy the app was.
+    """
+    import html
+
+    shown = rows[-MAX_LOG_LINES:]
+    body = (
+        log_header_html("Function", "Container") + merged_lines_html(modal_rows(shown, link=False))
+        if shown
+        else f"<div class='empty'>Nothing for this call in the last {TRACE_HOURS / 24:g} days.</div>"
+    )
+    containers = sorted({row["task_id"] for row in shown})
 
     return f"""<!doctype html>
 <html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -792,12 +902,15 @@ def trace_page_html(call_id: str, rows: list[dict]) -> str:
 <body><main>
   <header>
     <h1 class='mono'>{html.escape(call_id)}</h1>
-    <span class='muted small'>{len(rows):,} lines · {len(sessions)} session(s)</span>
-    <span class='muted small'>· <a href='../sessions'>all sessions</a>
+    <span class='muted small'>{len(rows):,} lines · {len(containers)} container(s)</span>
+    <span class='muted small'>· <a href='../modal'>all modal logs</a>
                               · <a href='../'>all runs</a></span>
   </header>
+  <p class='muted small'>What Modal saw of this one call, over the last
+     {TRACE_HOURS / 24:g} days.</p>
   <div class='log'>{body}</div>
-</main></body></html>"""
+</main>{LOG_JS}
+</body></html>"""
 
 
 # --------------------------------------------------------------------------------------
@@ -836,28 +949,36 @@ def build_web_app():
         """One run's train.jsonl, as written."""
         return HTMLResponse(ledger_page_html(run_id, await read_ledger(run_id)), headers=no_store)
 
-    @web.get("/sessions", response_class=HTMLResponse)
-    async def sessions():
-        """Every capture session applog has written to this volume."""
-        await volume.reload.aio()
-        return HTMLResponse(sessions_page_html(applog.list_sessions()), headers=no_store)
+    # The two Modal-log routes are `def`, not `async def`, and that is load-bearing.
+    # FastAPI runs a sync handler in its threadpool, which is exactly where
+    # `applog.fetch` has to be called from: it drives synchronicity's own event
+    # loop, and doing that from inside this one would deadlock. They touch no
+    # volume, so they skip the reload every other route pays for.
 
-    @web.get("/sessions/{session_id}", response_class=HTMLResponse)
-    async def session(session_id: str):
-        """One session's captured log -- Modal's whole view of the app for a window."""
-        await volume.reload.aio()
-        meta, rows = applog.read_session(session_id)
-        return HTMLResponse(session_page_html(session_id, meta, rows), headers=no_store)
+    @web.get("/modal", response_class=HTMLResponse)
+    def modal_logs(hours: float = MODAL_HOURS, q: str = "", app: str = ""):
+        """What Modal saw of the whole app, over a window, asked for right now.
+
+        Also what archives it: `applog.fetch` merges the answer into `modal_logs/`
+        on the way past, so opening this page is how history accumulates.
+
+        `?app=ap-…` reads one specific app record instead of resolving the name.
+        That is the rescue path for history stranded under an id `AppList` has
+        forgotten -- and since the read archives, visiting it once is enough.
+        """
+        rows = applog.fetch(volume, APP_NAME, hours=hours, search=q, app_id=app)
+        return HTMLResponse(modal_page_html(rows, hours, q, app), headers=no_store)
 
     @web.get("/trace/{call_id}", response_class=HTMLResponse)
-    async def trace(call_id: str):
-        """Everything Modal saw about one call, wherever it was captured.
+    def trace(call_id: str):
+        """Everything Modal saw about one call.
 
         The join between the two halves: `call_id` names a folder under a run and
-        column two of every captured line, so one id reaches both records.
+        tags every line Modal kept, so one id reaches both records. Modal does the
+        filtering, so this stays cheap however noisy the app was.
         """
-        await volume.reload.aio()
-        return HTMLResponse(trace_page_html(call_id, applog.trace_call(call_id)), headers=no_store)
+        rows = applog.fetch(volume, APP_NAME, hours=TRACE_HOURS, call_id=call_id)
+        return HTMLResponse(trace_page_html(call_id, rows), headers=no_store)
 
     @web.post("/cancel/{run_id}")
     async def cancel(run_id: str):

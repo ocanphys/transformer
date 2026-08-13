@@ -19,22 +19,47 @@ from transformer.tokenizer import Tokenizer, train_bpe
 logger = logging.getLogger(__name__)
 
 
+def utc_formatter(fields: str = "%(name)s %(levelname)s %(message)s") -> logging.Formatter:
+    """A formatter whose first column is this project's timestamp contract.
+
+    `2026-08-12T18:30:00.123Z`, UTC, fixed width, always column one. Every log in
+    this project starts that way -- `launcher/logs.py` for a Modal call,
+    `launcher/applog.py` for Modal's own stream -- which is what lets any two of
+    them be merged by sorting the raw strings, with no parsing and no timezone to
+    reason about.
+
+    Those two define the same format independently, and that is deliberate rather
+    than sloppy: the launcher's containers do not have this package installed, so
+    there is nothing to share. The contract is the shape, not an object.
+
+    `converter` is set on the instance rather than on `logging.Formatter`, so
+    asking for UTC here cannot silently restamp every other log in the process.
+    """
+    formatter = logging.Formatter(fmt=f"%(asctime)s.%(msecs)03dZ {fields}", datefmt="%Y-%m-%dT%H:%M:%S")
+    formatter.converter = time.gmtime
+    return formatter
+
+
 def configure_logging(level: int = logging.INFO) -> None:
     """Configure root logging for notebooks / scripts.
 
     Idempotent: calling multiple times only updates the level. Safe to call
     at the top of every notebook cell that may be re-run.
 
+    Timestamps are UTC, in the same shape a run's log file on the Volume uses, so
+    a line read in a notebook and a line read out of `runs/{run_id}/logs/` can be
+    lined up against each other without converting anything.
+
     Args:
         level: Log level (e.g. logging.INFO, logging.DEBUG).
     """
     root = logging.getLogger()
     if not root.handlers:
-        logging.basicConfig(
-            level=level,
-            format="%(asctime)s %(name)s %(levelname)s %(message)s",
-            datefmt="%H:%M:%S",
-        )
+        # Not basicConfig: the UTC converter lives on a formatter instance, and
+        # basicConfig only takes a format string.
+        handler = logging.StreamHandler()
+        handler.setFormatter(utc_formatter())
+        root.addHandler(handler)
     root.setLevel(level)
 
 
@@ -500,10 +525,16 @@ def run_training(
     # Named after rdir, so this call's logs are scoped to this run by
     # construction -- no shared handler to add/remove, no risk of a later
     # run_training call in the same process writing into this run's file.
+    #
+    # events.log is this function's own record and predates the Modal launcher; on
+    # that path `launcher/jobs.Train` does the training and writes
+    # `runs/{run_id}/logs/{call_id}/worker.log` instead, so nothing on Modal ever
+    # writes this file. It keeps the shared timestamp contract anyway, so a local
+    # run's log still merges against everything else.
     run_logger = logging.getLogger(f"{__name__}.{rdir.name}")
     run_logger.setLevel(logging.INFO)
     events_handler = logging.FileHandler(rdir / "events.log")
-    events_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    events_handler.setFormatter(utc_formatter())
     run_logger.addHandler(events_handler)
 
     if start_step == 0:
