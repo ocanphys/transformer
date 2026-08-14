@@ -129,6 +129,29 @@ train_image = (
     .add_local_python_source(*LOCAL_MODULES, "wandb_run", "transformer")
 )
 
+# EXPERIMENT. The dashboard's image, plus a Jupyter server and the project
+# environment a notebook expects to import -- so `/lab` can open a notebook in the
+# dashboard's own container, on the same /storage mount the page already reads.
+#
+# uv_pip_install, not pip_install: uv_sync puts its venv first on $PATH, and
+# pip_install would land these in the system python that venv shadows -- the
+# server would start and then fail to import torch.
+#
+# This is what makes the experiment expensive. web_image is debian_slim plus
+# fastapi; this is the whole lockfile, torch included, so the dashboard's cold
+# start goes from seconds to minutes. Warm containers hide it while a tab is open;
+# the first hit after idle pays it. Reverting is one word on the decorator below.
+lab_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_sync(uv_project_dir=PROJECT_ROOT)
+    .uv_pip_install("fastapi[standard]", "jupyterlab")
+    .add_local_python_source(*LOCAL_MODULES, "applog", "dashboard", "wandb_run", "transformer")
+)
+
+LAB_PORT = 8888  # what JupyterLab listens on inside its container
+LAB_TIMEOUT = 3600  # how long a lab lives before Modal reaps it -- the session length
+LAB_KEY = "lab"  # where a lab publishes its URL for the dashboard to find it again
+
 # --------------------------------------------------------------------------------------
 # liveness: the single source of truth for "is that call still running?"
 # --------------------------------------------------------------------------------------
@@ -731,6 +754,66 @@ def etl(run_id: str) -> dict:
     if returncode:
         raise RuntimeError(f"snakemake exited {returncode}")
     return {"run_id": run_id, "target": "all", "returncode": returncode}
+
+
+# --------------------------------------------------------------------------------------
+# the notebook: a JupyterLab on the Volume, in a container of its own
+# --------------------------------------------------------------------------------------
+
+
+@app.function(image=lab_image, volumes={"/storage": volume}, timeout=LAB_TIMEOUT, max_containers=1)
+def lab() -> None:
+    """Serve a JupyterLab rooted at the Volume, and publish where to reach it.
+
+    ITS OWN CONTAINER, AND THAT IS THE WHOLE POINT. Jupyter holds files open under
+    /storage for as long as it runs -- the file browser, autosave,
+    `.ipynb_checkpoints`, and every memmap or `torch.load` a cell makes -- and Modal
+    refuses to reload a Volume while any file under it is open. The dashboard
+    reloads on every single request. Run in the dashboard's container, this took
+    spurious 500s from ~0.1/min to ~4.7/min and made the page unusable; it is the
+    same collision `single_use_containers=True` protects `work` from, arrived at
+    from the other direction.
+
+    Nothing here ever reloads, so open files cost this container nothing. The price
+    is the mirror image: it sees the snapshot it booted with, so a checkpoint
+    written after the lab started is not visible to it. `volume.reload()` from a
+    cell picks those up -- and works, because at that moment you know what you have
+    open.
+
+    Blocks until Jupyter exits, which it does not, so `timeout` is the session
+    length. Returns nothing: the URL goes to the Dict, since a spawned call's
+    return value is not what the dashboard is waiting on.
+    """
+    import secrets
+    import subprocess
+
+    token = secrets.token_urlsafe(32)
+    with modal.forward(LAB_PORT) as tunnel:
+        # Written before Jupyter is up, so the dashboard can tell "booting" from
+        # "nothing running" -- a `lab` key whose call is alive but has no url yet.
+        leases[LAB_KEY] = {
+            "call_id": modal.current_function_call_id(),
+            "url": f"{tunnel.url}/lab?token={token}",
+        }
+        subprocess.run(
+            [
+                "jupyter",
+                "lab",
+                f"--port={LAB_PORT}",
+                "--ip=0.0.0.0",
+                "--no-browser",
+                "--allow-root",
+                f"--IdentityProvider.token={token}",
+                # The tunnel is a different origin than the server believes it is
+                # served from, so these two are load-bearing rather than hardening
+                # knobs: without them the page loads and the websocket to the kernel
+                # is refused, which reads as "cells never run".
+                "--ServerApp.allow_origin=*",
+                "--ServerApp.allow_remote_access=True",
+                f"--ServerApp.root_dir={STORAGE}",
+            ],
+            check=False,
+        )
 
 
 # --------------------------------------------------------------------------------------

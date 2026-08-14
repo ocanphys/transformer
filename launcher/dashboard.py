@@ -20,7 +20,7 @@ from pathlib import Path
 import modal
 
 import applog
-from app import JOB, APP_NAME, lease_key, leases, status, volume
+from app import JOB, APP_NAME, LAB_KEY, lease_key, leases, status, volume
 from jobs import RUNS, Aborted, load_config, run_dir
 
 REFRESH_MS = 3000  # how often the page asks for fresh rows
@@ -30,6 +30,9 @@ REFRESH_MS = 3000  # how often the page asks for fresh rows
 # of the DAG, which is what makes a cap worth having. The newest lines are the
 # ones kept -- a log is read from the end.
 MAX_LOG_LINES = 5000
+
+# How often the waiting page re-asks `/lab` while a notebook container boots.
+LAB_POLL_S = 4
 
 # What each derived status is called on screen. The colour lives in the stylesheet
 # as `.st-<status>`, so light and dark can differ -- plain coloured text has to
@@ -116,17 +119,41 @@ def live_step(rdir: Path) -> int | None:
     return max(steps, default=None)
 
 
-async def scan() -> list[dict]:
-    """One row per run folder, newest first.
+async def reload_volume() -> bool:
+    """Pull the newest snapshot into this container. True if it landed.
+
+    Modal refuses to swap the mount while any file under it is open, and this
+    container serves many requests at once (`modal.concurrent` in app.py) -- so a
+    reload races every other request that is mid-read on a log, a ledger or a
+    progress file, and sometimes loses. Measured before this existed: 7 spurious
+    500s across an hour of ordinary polling, and 80 in the seventeen minutes a
+    notebook was open on the same mount.
+
+    Losing that race is a freshness problem, not a correctness one. The snapshot
+    already mounted is a consistent view of the Volume, just an older one, and
+    every reader below treats it identically. So the failure is reported upward
+    and drawn rather than raised: a page one poll behind is worth far more than a
+    500, and saying which it is costs one header.
+    """
+    try:
+        await volume.reload.aio()
+        return True
+    except RuntimeError:  # "there are open files preventing the operation"
+        return False
+
+
+async def scan() -> tuple[list[dict], bool]:
+    """One row per run folder newest first, and whether the snapshot is fresh.
 
     Reloads the volume first: this container is long-lived, so its snapshot is
-    stale by default -- the same reason `launch` and `work` reload.
+    stale by default -- the same reason `launch` and `work` reload. That reload is
+    allowed to fail; see `reload_volume`.
 
     Liveness is asked only about runs that are not finished, and all of those
     questions go out together, so the page costs one round-trip rather than one
     per run.
     """
-    await volume.reload.aio()
+    fresh = await reload_volume()
 
     runs = []
     for rdir in sorted(RUNS.iterdir(), reverse=True) if RUNS.exists() else []:
@@ -179,7 +206,7 @@ async def scan() -> list[dict]:
     for row in runs:
         row.setdefault("status", "completed" if row.get("complete") else "stopped")
         row.setdefault("attempt", None)
-    return runs
+    return runs, fresh
 
 
 async def _no_lease():
@@ -401,6 +428,7 @@ def page_html(runs: list[dict]) -> str:
     <h1>Runs</h1>
     <span class='muted small' id='meta'>{len(runs)} runs</span>
     <span class='muted small'>· <a href='modal'>modal logs</a></span>
+    <span class='muted small'>· <a href='lab' target='_blank' rel='noopener'>notebook</a></span>
   </header>
   <table>
     <thead><tr><th>Run</th><th>Status</th><th>Progress</th><th>Attempt</th><th></th></tr></thead>
@@ -416,7 +444,13 @@ async function refresh() {{
     if (!r.ok) return;
     rows.innerHTML = await r.text();
     const n = rows.querySelectorAll('tr').length;
-    meta.textContent = `${{n}} runs · updated ${{new Date().toLocaleTimeString()}}`;
+    // The volume reload can lose a race against another request holding a file
+    // open, in which case these rows come off the previous snapshot. Say so --
+    // silently showing older numbers as if they were current is the one thing
+    // this page must not do.
+    const stale = r.headers.get('X-Stale') === '1';
+    meta.textContent = `${{n}} runs · updated ${{new Date().toLocaleTimeString()}}`
+                     + (stale ? ' · stale' : '');
   }} catch (e) {{}}
 }}
 
@@ -913,6 +947,31 @@ def trace_page_html(call_id: str, rows: list[dict]) -> str:
 </body></html>"""
 
 
+def lab_waiting_html() -> str:
+    """Shown while a notebook container boots, and re-asks `/lab` until it answers.
+
+    A meta refresh rather than script: the only thing this page does is ask the
+    same question again, and the route is idempotent, so there is nothing for a
+    script to hold. When the lab has published its URL, `/lab` redirects instead of
+    serving this and the tab lands on Jupyter.
+    """
+    return f"""<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<meta http-equiv='refresh' content='{LAB_POLL_S}'>
+<title>Starting the notebook…</title>
+<style>{THEME_CSS}</style></head>
+<body><main>
+  <header><h1>Starting the notebook…</h1></header>
+  <p class='muted small'>A container is coming up with the project environment on it — torch and
+     the whole lockfile, so a cold start is minutes rather than seconds. This page re-checks every
+     {LAB_POLL_S}s and will send you on as soon as Jupyter answers.</p>
+  <p class='muted small'>It opens rooted at the Volume, so <span class='mono'>runs/</span> and
+     <span class='mono'>data/</span> are in the file browser. It reads the snapshot it booted with;
+     call <span class='mono'>volume.reload()</span> in a cell to pick up newer checkpoints.</p>
+  <p class='muted small'><a href='./'>back to all runs</a></p>
+</main></body></html>"""
+
+
 # --------------------------------------------------------------------------------------
 # routes
 # --------------------------------------------------------------------------------------
@@ -932,11 +991,15 @@ def build_web_app():
 
     @web.get("/", response_class=HTMLResponse)
     async def index():
-        return HTMLResponse(page_html(await scan()), headers=no_store)
+        runs, _ = await scan()
+        return HTMLResponse(page_html(runs), headers=no_store)
 
     @web.get("/rows", response_class=HTMLResponse)
     async def rows():
-        return HTMLResponse(rows_html(await scan()), headers=no_store)
+        runs, fresh = await scan()
+        # A header rather than markup: the rows are the same either way, and only
+        # the meta line has anything to say about how old they are.
+        return HTMLResponse(rows_html(runs), headers={**no_store, "X-Stale": "0" if fresh else "1"})
 
     @web.get("/logs/{run_id}", response_class=HTMLResponse)
     async def logs(run_id: str):
@@ -989,6 +1052,33 @@ def build_web_app():
             return {"ok": False, "reason": "no lease -- nothing to cancel"}
         await modal.FunctionCall.from_id(grant["call_id"]).cancel.aio()
         return {"ok": True, "reason": f"cancelled {grant['call_id']}"}
+
+    @web.get("/lab")
+    async def lab():
+        """Send the browser to a JupyterLab on the Volume, starting one if needed.
+
+        Never blocks on the boot. `lab_image` is the whole lockfile, so a cold start
+        is minutes and `timeout=60` on this function is the ceiling -- waiting here
+        would guarantee the first click fails. Instead: spawn, answer immediately
+        with a page that re-asks, and redirect once the lab has published its URL.
+        That also makes the click idempotent, which matters because the waiting page
+        re-requests this route every few seconds.
+
+        EXPERIMENT, with a real edge on it: this endpoint is as public as the
+        dashboard, and behind it is a notebook with `--allow-root` and a read-write
+        mount of the whole Volume. Anyone who can load this page can run code in
+        that container. The token guards the tunnel URL, not this route.
+        """
+        from fastapi.responses import HTMLResponse, RedirectResponse
+
+        entry = await leases.get.aio(LAB_KEY)
+        if entry and await status(modal.FunctionCall.from_id(entry["call_id"])) == "running":
+            return RedirectResponse(entry["url"])
+
+        # No lab, or the last one has exited. Start one; it writes its own entry
+        # over this key as soon as its tunnel is up.
+        await modal.Function.from_name(APP_NAME, "lab").spawn.aio()
+        return HTMLResponse(lab_waiting_html(), headers=no_store)
 
     @web.post("/resume/{run_id}")
     async def resume(run_id: str):
